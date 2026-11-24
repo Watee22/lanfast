@@ -56,7 +56,7 @@ public class MainActivity extends Activity implements Core.Listener {
     View homeView, chatView;
 
     // 首页控件
-    TextView myPinText, relayBar, homePending, homeEmpty, homeFooter;
+    TextView myPinText, webBar, relayBar, homePending, homeEmpty, homeFooter;
     ListView friendListView;
     FriendAdapter friendAdapter;
     final ArrayList<Core.Device> friendItems = new ArrayList<>();
@@ -183,6 +183,21 @@ public class MainActivity extends Activity implements Core.Listener {
         });
         pinRow.addView(refPin, new LinearLayout.LayoutParams(-2, -2));
         pinCard.addView(pinRow);
+
+        webBar = new TextView(this);
+        webBar.setTextSize(12);
+        webBar.setTextColor(0xFF0F766E);
+        webBar.setTypeface(Typeface.DEFAULT_BOLD);
+        webBar.setPadding(dp(8), dp(6), dp(8), dp(6));
+        webBar.setBackground(round(0xFFF0FDFA, 0xFF99F6E4));
+        webBar.setOnClickListener(v -> {
+            String url = "http://" + Core.localIp() + ":" + WebBridge.WEB_PORT;
+            copy(url);
+            toast("已复制网页地址：" + url);
+        });
+        LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(-1, -2);
+        wlp.topMargin = dp(8);
+        pinCard.addView(webBar, wlp);
 
         relayBar = new TextView(this);
         relayBar.setTextSize(12);
@@ -415,7 +430,8 @@ public class MainActivity extends Activity implements Core.Listener {
             Core.Device d = core.friend(activePeerId);
             chatTitle.setText(d.label());
             String sasTag = (d.sas != null && !d.sas.isEmpty()) ? ("安全码 " + d.sas + " · ") : "";
-            chatSub.setText("🔒 " + sasTag + "SPAKE2+AES256 · " + d.loc());
+            String protoTag = "web".equals(d.os) ? "🌐 网页直连 · " : "🔒 SPAKE2+AES256 · ";
+            chatSub.setText(protoTag + sasTag + d.loc());
             core.unread.remove(activePeerId);
             msgAdapter.notifyDataSetChanged();
             if (!pending.isEmpty()) sendPendingTo(d);
@@ -458,7 +474,9 @@ public class MainActivity extends Activity implements Core.Listener {
     }
 
     void renderFooter() {
-        homeFooter.setText("本机：" + core.name + "  ·  局域网 IP：" + Core.localIp()
+        String ip = Core.localIp();
+        webBar.setText("🍎 苹果/浏览器免安装访问：http://" + ip + ":" + WebBridge.WEB_PORT + "（点此复制）");
+        homeFooter.setText("本机：" + core.name + "  ·  局域网 IP：" + ip
                 + "  ·  局域网发现 " + core.discoveredCount() + " 台设备\n接收目录：" + core.saveDir().getAbsolutePath());
     }
 

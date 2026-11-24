@@ -105,6 +105,7 @@ public class Core {
         public long lastSeen;
 
         public String label() {
+            if ("web".equals(os)) return "🌐 " + name;
             return ("android".equals(os) ? "📱 " : "💻 ") + name;
         }
 
@@ -167,6 +168,7 @@ public class Core {
     private final Set<String> joined = new HashSet<>();
     private final ExecutorService sender = Executors.newSingleThreadExecutor();
     private final ExecutorService pool = Executors.newCachedThreadPool();
+    public final WebBridge webBridge;
 
     private volatile boolean running;
     private volatile int gen;
@@ -193,6 +195,7 @@ public class Core {
         name = prefs.getString("name", Build.MODEL);
         relayAddr = prefs.getString("relay_addr", "");
         relayKey = prefs.getString("relay_key", "");
+        webBridge = new WebBridge(this, WebBridge.WEB_PORT);
     }
 
     private String generatePin() {
@@ -264,6 +267,7 @@ public class Core {
         pool.execute(() -> serverLoop(g));
         pool.execute(() -> udpLoop(g));
         pool.execute(() -> announceLoop(g));
+        webBridge.start();
         restartRelay();
     }
 
@@ -275,6 +279,7 @@ public class Core {
         if (!running) return;
         running = false;
         relayGen++;
+        webBridge.stop();
         final MulticastSocket u = udp;
         final ServerSocket s = server;
         final Socket rs = relaySock;
@@ -334,9 +339,55 @@ public class Core {
         }
     }
 
+    public void registerWebDevice(String cid, String nm, String ip, String token, String sas) {
+        Device d = new Device();
+        d.id = cid;
+        d.name = nm;
+        d.os = "web";
+        d.ip = ip;
+        d.port = WebBridge.WEB_PORT;
+        d.token = token;
+        d.sas = sas;
+        d.lastSeen = System.currentTimeMillis();
+        saveFriend(d);
+        status("🌐 网页设备 " + nm + " 已通过 SPAKE2 连接（安全码 " + sas + "）", -1);
+    }
+
+    public void onWebIncomingText(String peerId, String peerName, String text) {
+        Msg m = new Msg();
+        m.peerId = peerId;
+        m.peer = peerName;
+        m.incoming = true;
+        m.route = "网页端";
+        m.text = text;
+        post(m);
+    }
+
+    public void onWebIncomingFile(String peerId, String peerName, File f) {
+        Msg m = new Msg();
+        m.peerId = peerId;
+        m.peer = peerName;
+        m.incoming = true;
+        m.isFile = true;
+        m.route = "网页端";
+        m.text = f.getName();
+        m.path = f.getAbsolutePath();
+        m.size = f.length();
+        post(m);
+        status("🌐 [网页端] 已接收 " + f.getName(), 100);
+    }
+
+    public void reportWebStatus(String s, int percent) {
+        status(s, percent);
+    }
+
     public void removeFriend(String did) {
+        Device removed;
         synchronized (paired) {
-            paired.remove(did);
+            removed = paired.remove(did);
+        }
+        if (removed != null && "web".equals(removed.os)) {
+            webBridge.kick(did);
         }
         fireFriends();
     }
@@ -1275,6 +1326,13 @@ public class Core {
             m.peer = d.name;
             m.text = text;
             try {
+                if ("web".equals(d.os)) {
+                    m.route = "网页端";
+                    webBridge.pushText(d.id, text);
+                    status("🌐 [网页端] 文字已推送到 " + d.name, -1);
+                    post(m);
+                    return;
+                }
                 Conn c = connectSmart(d);
                 m.route = c.route;
                 try (Socket s = c.sock) {
@@ -1316,6 +1374,23 @@ public class Core {
             m.isFile = true;
             busy(true);
             try {
+                if ("web".equals(d.os)) {
+                    m.route = "网页端";
+                    long webTotal = 0;
+                    String firstName = "文件";
+                    for (int i = 0; i < copy.size(); i++) {
+                        String nm = queryName(cr, copy.get(i));
+                        if (i == 0) firstName = nm;
+                        long sz = querySize(cr, copy.get(i));
+                        if (sz > 0) webTotal += sz;
+                    }
+                    webBridge.pushUris(d.id, copy);
+                    m.text = copy.size() == 1 ? firstName : firstName + " 等 " + copy.size() + " 个文件";
+                    m.size = webTotal;
+                    status("🌐 [网页端] 已推送给 " + d.name + "（请在浏览器点下载）", 100);
+                    post(m);
+                    return;
+                }
                 status("正在准备文件…", 0);
                 for (Uri u : copy) {
                     Item it = new Item();
