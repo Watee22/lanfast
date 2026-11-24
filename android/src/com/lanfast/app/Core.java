@@ -40,9 +40,10 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.Charset;
-import java.security.KeyPair;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -67,7 +68,7 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class Core {
     public static final String APP = "lanfast";
-    public static final int PROTO_VERSION = 4;
+    public static final int PROTO_VERSION = 5;
     public static final int DISCOVERY_PORT = 53530;
     public static final int TRANSFER_PORT = 53531;
     public static final int DEFAULT_RELAY_PORT = 53532;
@@ -97,7 +98,7 @@ public class Core {
     }
 
     public static class Device {
-        public String id, name, os, ip, token, bootId;
+        public String id, name, os, ip, token, sas, bootId;
         public byte[] key; // 32 字节 AES-256-GCM 端到端会话密钥
         public int port;
         public boolean viaRelay;
@@ -127,6 +128,7 @@ public class Core {
     static class HostPort {
         String host;
         int port;
+        boolean useTls;
     }
 
     static class Conn {
@@ -214,6 +216,13 @@ public class Core {
         String s = addr.trim();
         if (s.isEmpty()) return null;
         HostPort hp = new HostPort();
+        String low = s.toLowerCase(Locale.US);
+        if (low.startsWith("tls://")) {
+            hp.useTls = true;
+            s = s.substring(6);
+        } else if (low.startsWith("tcp://")) {
+            s = s.substring(6);
+        }
         int idx = s.lastIndexOf(':');
         if (idx > 0 && idx < s.length() - 1) {
             hp.host = s.substring(0, idx).trim();
@@ -227,6 +236,16 @@ public class Core {
             hp.port = DEFAULT_RELAY_PORT;
         }
         return hp.host.isEmpty() ? null : hp;
+    }
+
+    static Socket connectRelaySocket(String host, int port, boolean useTls, int timeoutMs) throws IOException {
+        Socket raw = new Socket();
+        raw.connect(new InetSocketAddress(host, port), timeoutMs);
+        if (!useTls) return raw;
+        SSLSocket ssl = (SSLSocket) ((SSLSocketFactory) SSLSocketFactory.getDefault()).createSocket(raw, host, port, true);
+        ssl.setSoTimeout(timeoutMs);
+        ssl.startHandshake();
+        return ssl;
     }
 
     // ------------------------------------------------------------------ 生命周期
@@ -350,8 +369,9 @@ public class Core {
         }
         final String host = hp.host;
         final int port = hp.port;
+        final boolean useTls = hp.useTls;
         final String key = relayKey;
-        pool.execute(() -> relayLoop(rg, host, port, key));
+        pool.execute(() -> relayLoop(rg, host, port, useTls, key));
     }
 
     private void sendRelayUpdate() {
@@ -362,7 +382,7 @@ public class Core {
                 JSONObject j = new JSONObject();
                 j.put("app", APP);
                 j.put("type", "relay_update");
-                j.put("pin", pin);
+                j.put("pin_tag", Crypto.pinRouteTag(pin, relayKey));
                 j.put("name", name);
                 j.put("boot", bootId);
                 synchronized (relayWriteLock) {
@@ -373,13 +393,12 @@ public class Core {
         });
     }
 
-    private void relayLoop(int rg, String host, int port, String key) {
+    private void relayLoop(int rg, String host, int port, boolean useTls, String key) {
         while (running && relayGen == rg) {
             fireRelayState(false, "正在连接中转 " + host + ":" + port + "…");
             Socket s = null;
             try {
-                s = new Socket();
-                s.connect(new InetSocketAddress(host, port), 8000);
+                s = connectRelaySocket(host, port, useTls, 8000);
                 s.setSoTimeout(25000);
                 DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
                 DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
@@ -390,7 +409,7 @@ public class Core {
                 reg.put("id", id);
                 reg.put("name", name);
                 reg.put("os", "android");
-                reg.put("pin", pin);
+                reg.put("pin_tag", Crypto.pinRouteTag(pin, key));
                 reg.put("boot", bootId);
                 synchronized (relayWriteLock) {
                     writeFrame(out, reg);
@@ -405,7 +424,7 @@ public class Core {
                 }
                 relaySock = s;
                 relayConnected = true;
-                fireRelayState(true, "公网中转已连接 (" + host + ":" + port + ")");
+                fireRelayState(true, (useTls ? "TLS " : "") + "公网中转已连接 (" + host + ":" + port + ")");
                 while (running && relayGen == rg) {
                     try {
                         JSONObject msg = readFrame(in);
@@ -413,7 +432,7 @@ public class Core {
                         if ("tunnel_incoming".equals(msg.optString("type"))) {
                             final String sid = msg.optString("streamId");
                             if (!sid.isEmpty()) {
-                                pool.execute(() -> joinRelayTunnel(host, port, key, sid));
+                                pool.execute(() -> joinRelayTunnel(host, port, useTls, key, sid));
                             }
                         }
                     } catch (SocketTimeoutException te) {
@@ -438,10 +457,9 @@ public class Core {
         }
     }
 
-    private void joinRelayTunnel(String host, int port, String key, String streamId) {
+    private void joinRelayTunnel(String host, int port, boolean useTls, String key, String streamId) {
         try {
-            Socket s = new Socket();
-            s.connect(new InetSocketAddress(host, port), 8000);
+            Socket s = connectRelaySocket(host, port, useTls, 8000);
             s.setSoTimeout(15000);
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
             DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
@@ -464,9 +482,9 @@ public class Core {
     private Socket openRelayTunnel(String toId, String targetPin) throws Exception {
         HostPort hp = parseRelay(relayAddr);
         if (hp == null) throw new IOException("未配置公网中转服务器");
-        Socket s = new Socket();
+        Socket s = null;
         try {
-            s.connect(new InetSocketAddress(hp.host, hp.port), 8000);
+            s = connectRelaySocket(hp.host, hp.port, hp.useTls, 8000);
             s.setSoTimeout(20000);
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
             DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
@@ -476,7 +494,7 @@ public class Core {
             req.put("key", relayKey);
             req.put("from", id);
             if (toId != null && !toId.isEmpty()) req.put("to", toId);
-            if (targetPin != null && !targetPin.isEmpty()) req.put("pin", targetPin);
+            if (targetPin != null && !targetPin.isEmpty()) req.put("pin_tag", Crypto.pinRouteTag(targetPin, relayKey));
             writeFrame(out, req);
             JSONObject ack = readFrame(in);
             if (ack == null || !ack.optBoolean("ok")) {
@@ -753,47 +771,47 @@ public class Core {
         DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
         DataInputStream in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
 
-        KeyPair kp = Crypto.genEcKeyPair();
-        byte[] saltA = Crypto.randomBytes(16);
-        JSONObject hello = me("pair_hello");
-        hello.put("pub", Crypto.pubB64(kp));
-        hello.put("salt", Crypto.b64e(saltA));
+        Crypto.Spake2Initiator sp = new Crypto.Spake2Initiator(id, targetPin);
+        JSONObject hello = me("spake_hello");
+        hello.put("pA", sp.pAB64());
         writeFrame(out, hello);
 
-        JSONObject chal = readFrame(in);
-        if (chal == null || !chal.optBoolean("ok") || chal.optString("pub").isEmpty() || chal.optString("salt").isEmpty()) {
-            r.error = chal == null ? "对方无响应" : chal.optString("error", "对方不支持端到端加密");
+        JSONObject reply = readFrame(in);
+        if (reply == null || !reply.optBoolean("ok") || reply.optString("pB").isEmpty() || reply.optString("id").isEmpty()) {
+            r.error = reply == null ? "对方无响应" : reply.optString("error", "对方版本过旧，请升级两端至 v5 (SPAKE2)");
             return r;
         }
-        byte[] saltB = Crypto.b64d(chal.optString("salt"));
-        byte[] sharedZ = Crypto.ecdhSecret(kp.getPrivate(), chal.optString("pub"));
-        String proof = Crypto.pinProof(sharedZ, targetPin, saltA, saltB);
-        byte[] aesKey = Crypto.deriveSessionKey(sharedZ, targetPin, saltA, saltB);
+        Crypto.SpakeResult sr = sp.finish(reply.optString("id"), reply.optString("pB"));
 
         JSONObject ver = new JSONObject();
         ver.put("app", APP);
         ver.put("v", PROTO_VERSION);
-        ver.put("type", "pair_verify");
-        ver.put("proof", proof);
+        ver.put("type", "spake_confirm");
+        ver.put("confA", sr.confA);
         writeFrame(out, ver);
 
         JSONObject ack = readFrame(in);
         if (ack != null && ack.optBoolean("ok") && !ack.optString("n").isEmpty() && !ack.optString("ct").isEmpty()) {
-            JSONObject box = Crypto.decryptJson(aesKey, ack.optString("n"), ack.optString("ct"), "pair_ok");
+            JSONObject box = Crypto.decryptJson(sr.aesKey, ack.optString("n"), ack.optString("ct"), "spake_ok");
+            if (!MessageDigest.isEqual(sr.confB.getBytes(UTF8), box.optString("confB", "").getBytes(UTF8))) {
+                r.error = "双向密钥确认失败（疑似中间人攻击）";
+                return r;
+            }
             String tok = box.optString("token");
             if (tok.isEmpty()) {
                 r.error = "加密令牌校验失败";
                 return r;
             }
             Device d = new Device();
-            d.id = chal.optString("id");
-            d.name = chal.optString("name", ip.isEmpty() ? "好友" : ip);
-            d.os = chal.optString("os", "windows");
+            d.id = reply.optString("id");
+            d.name = reply.optString("name", ip.isEmpty() ? "好友" : ip);
+            d.os = reply.optString("os", "windows");
             d.ip = viaRelay ? "" : ip;
-            d.port = chal.optInt("port", port);
+            d.port = reply.optInt("port", port);
             d.token = tok;
-            d.key = aesKey;
-            d.bootId = chal.optString("boot", "");
+            d.key = sr.aesKey;
+            d.sas = sr.sas;
+            d.bootId = reply.optString("boot", "");
             d.viaRelay = viaRelay;
             d.lastSeen = System.currentTimeMillis();
             if (viaRelay) {
@@ -955,30 +973,31 @@ public class Core {
             }
         }
         String did = hello.optString("id");
-        String pubA = hello.optString("pub");
-        String saltAB64 = hello.optString("salt");
-        if (did.isEmpty() || did.equals(id) || pubA.isEmpty() || saltAB64.isEmpty()) {
-            writeFrame(out, errObj("无效的加密握手请求", false));
+        String pA = hello.optString("pA");
+        if (did.isEmpty() || did.equals(id) || pA.isEmpty()) {
+            writeFrame(out, errObj("无效的 SPAKE2 握手请求", false));
             return;
         }
-        KeyPair kp = Crypto.genEcKeyPair();
-        byte[] saltA = Crypto.b64d(saltAB64);
-        byte[] saltB = Crypto.randomBytes(16);
-        byte[] sharedZ = Crypto.ecdhSecret(kp.getPrivate(), pubA);
+        Crypto.Spake2Responder sp = new Crypto.Spake2Responder(id, pin);
+        Crypto.SpakeResult sr;
+        try {
+            sr = sp.finish(did, pA);
+        } catch (Exception ex) {
+            writeFrame(out, errObj("无效的椭圆曲线点", false));
+            return;
+        }
 
-        JSONObject chal = me("pair_challenge");
-        chal.put("ok", true);
-        chal.put("pub", Crypto.pubB64(kp));
-        chal.put("salt", Crypto.b64e(saltB));
-        writeFrame(out, chal);
+        JSONObject reply = me("spake_reply");
+        reply.put("ok", true);
+        reply.put("pB", sp.pBB64());
+        writeFrame(out, reply);
 
         JSONObject ver = readFrame(in);
-        if (ver == null || !"pair_verify".equals(ver.optString("type"))) return;
+        if (ver == null || !"spake_confirm".equals(ver.optString("type"))) return;
 
-        String expected = Crypto.pinProof(sharedZ, pin, saltA, saltB);
-        String got = ver.optString("proof", "");
+        String gotA = ver.optString("confA", "");
         synchronized (failMap) {
-            if (!MessageDigest.isEqual(got.getBytes(UTF8), expected.getBytes(UTF8))) {
+            if (!MessageDigest.isEqual(gotA.getBytes(UTF8), sr.confA.getBytes(UTF8))) {
                 FailState fs = failMap.get(rateKey);
                 if (fs == null) {
                     fs = new FailState();
@@ -997,7 +1016,6 @@ public class Core {
             failMap.remove(rateKey);
         }
 
-        byte[] aesKey = Crypto.deriveSessionKey(sharedZ, pin, saltA, saltB);
         String token = randomHex(24);
         Device d = new Device();
         d.id = did;
@@ -1005,7 +1023,8 @@ public class Core {
         d.os = hello.optString("os", "windows");
         d.port = hello.optInt("port", TRANSFER_PORT);
         d.token = token;
-        d.key = aesKey;
+        d.key = sr.aesKey;
+        d.sas = sr.sas;
         d.bootId = hello.optString("boot", "");
         d.lastSeen = System.currentTimeMillis();
         if (viaRelay) {
@@ -1019,14 +1038,15 @@ public class Core {
             d.viaRelay = false;
         }
         saveFriend(d);
-        status("🔒 " + d.name + " 已通过端到端加密验证加为好友", -1);
+        status("🔒 " + d.name + " 已通过 SPAKE2 验证加为好友（安全码 " + sr.sas + "）", -1);
 
         JSONObject tokObj = new JSONObject();
         tokObj.put("token", token);
-        Crypto.EncBox box = Crypto.encryptJson(aesKey, tokObj, "pair_ok");
+        tokObj.put("confB", sr.confB);
+        Crypto.EncBox box = Crypto.encryptJson(sr.aesKey, tokObj, "spake_ok");
         JSONObject ack = new JSONObject();
         ack.put("ok", true);
-        ack.put("type", "pair_ok");
+        ack.put("type", "spake_ok");
         ack.put("n", box.nB64);
         ack.put("ct", box.ctB64);
         writeFrame(out, ack);
@@ -1046,7 +1066,7 @@ public class Core {
                     JSONObject a = me("pong");
                     a.put("ok", true);
                     writeFrame(out, a);
-                } else if ("pair_hello".equals(t)) {
+                } else if ("spake_hello".equals(t)) {
                     handlePairHandshake(in, out, h, ip, viaRelay);
                     break;
                 } else if ("enc".equals(t)) {

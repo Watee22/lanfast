@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-LanFast 轻量级公网中转服务器（纯 Python 3.8+ 标准库，零第三方依赖）
+LanFast 轻量级公网中转服务器 v5（零明文 PIN 路由 + 可选原生 TLS）
 
-作用：
-  当两台设备不在同一个局域网（例如手机用 5G、家里电脑连公司电脑）时，
-  提供按 6 位验证码路由 + 透明 TCP 数据隧道转发。
-  服务器不保存任何聊天记录或文件，所有业务帧与 token 仍由两端自行校验。
+安全特性：
+  * 客户端注册与查找时只发送加盐哈希 pin_tag，不向中转服务器发送明文 6 位验证码；
+  * 隧道内部运行端到端 SPAKE2-P256 + AES-256-GCM，中转服务器无法看到任何聊天内容、文件或令牌；
+  * 支持 --cert / --key 开启原生 TLS 传输加密，零第三方依赖。
 
 启动示例：
-  python relay_server.py --host 0.0.0.0 --port 53532
-  python relay_server.py --host 0.0.0.0 --port 53532 --key my-secret-key
+  python3 relay_server.py --host 0.0.0.0 --port 53532 --key my-secret-key
+  python3 relay_server.py --host 0.0.0.0 --port 53532 --key my-secret-key --cert fullchain.pem --keyfile privkey.pem
 """
 import argparse
 import asyncio
@@ -17,6 +17,7 @@ import hmac
 import json
 import logging
 import secrets
+import ssl
 import struct
 import time
 
@@ -47,11 +48,11 @@ async def write_frame(writer: asyncio.StreamWriter, obj: dict):
 
 
 class ClientInfo:
-    def __init__(self, device_id, name, os_, pin, boot, writer, ip):
+    def __init__(self, device_id, name, os_, pin_tag, boot, writer, ip):
         self.id = device_id
         self.name = name
         self.os = os_
-        self.pin = pin
+        self.pin_tag = pin_tag  # SHA-256 加盐哈希，服务端不接触明文 6 位码
         self.boot = boot
         self.writer = writer
         self.ip = ip
@@ -76,18 +77,18 @@ class PendingTunnel:
 class RelayServer:
     def __init__(self, server_key=""):
         self.server_key = server_key or ""
-        self.clients: dict[str, ClientInfo] = {}        # device_id -> ClientInfo
-        self.pending: dict[str, PendingTunnel] = {}     # stream_id -> PendingTunnel
-        self.fail_state: dict[str, tuple[int, float]] = {}  # ip -> (fails, lock_until)
+        self.clients: dict[str, ClientInfo] = {}
+        self.pending: dict[str, PendingTunnel] = {}
+        self.fail_state: dict[str, tuple[int, float]] = {}
 
     def _check_key(self, msg):
         if not self.server_key:
             return True
         return hmac.compare_digest(str(msg.get("key", "")), self.server_key)
 
-    def _find_by_pin(self, pin: str, exclude_id: str = ""):
+    def _find_by_tag(self, pin_tag: str, exclude_id: str = ""):
         for c in self.clients.values():
-            if c.id != exclude_id and c.pin and hmac.compare_digest(c.pin, pin):
+            if c.id != exclude_id and c.pin_tag and hmac.compare_digest(c.pin_tag, pin_tag):
                 return c
         return None
 
@@ -128,8 +129,9 @@ class RelayServer:
         if not did:
             await write_frame(writer, {"ok": False, "error": "missing device id"})
             return
+        tag = str(first.get("pin_tag", ""))
         info = ClientInfo(did, first.get("name", "?"), first.get("os", "?"),
-                          str(first.get("pin", "")), str(first.get("boot", "")), writer, ip)
+                          tag, str(first.get("boot", "")), writer, ip)
         old = self.clients.get(did)
         if old is not None and old.writer is not writer:
             try:
@@ -146,8 +148,8 @@ class RelayServer:
                 if mt == "relay_ping":
                     await info.send({"type": "relay_pong", "ok": True, "online": len(self.clients)})
                 elif mt == "relay_update":
-                    if "pin" in msg:
-                        info.pin = str(msg["pin"])
+                    if "pin_tag" in msg:
+                        info.pin_tag = str(msg["pin_tag"])
                     if "name" in msg:
                         info.name = str(msg["name"])
                     if "boot" in msg:
@@ -164,7 +166,7 @@ class RelayServer:
         now = time.time()
         from_id = str(first.get("from", ""))
         to_id = str(first.get("to", ""))
-        pin = str(first.get("pin", "")).strip()
+        pin_tag = str(first.get("pin_tag", "")).strip()
 
         target = None
         if to_id:
@@ -172,13 +174,13 @@ class RelayServer:
             if target is None:
                 await write_frame(writer, {"ok": False, "error": "对方当前未连接到中转服务器"})
                 return True
-        elif pin:
+        elif pin_tag:
             fails, lock_until = self.fail_state.get(ip, (0, 0.0))
             if now < lock_until:
                 wait = int(lock_until - now) + 1
                 await write_frame(writer, {"ok": False, "error": f"验证码尝试次数过多，请 {wait} 秒后再试"})
                 return True
-            target = self._find_by_pin(pin, exclude_id=from_id)
+            target = self._find_by_tag(pin_tag, exclude_id=from_id)
             if target is None:
                 fails += 1
                 if fails >= MAX_PIN_FAILS:
@@ -186,11 +188,11 @@ class RelayServer:
                     await write_frame(writer, {"ok": False, "error": f"验证码错误次数过多，请 {PIN_LOCK_SECONDS} 秒后再试"})
                 else:
                     self.fail_state[ip] = (fails, 0.0)
-                    await write_frame(writer, {"ok": False, "error": "中转服务器上未找到该 6 位验证码对应的在线设备"})
+                    await write_frame(writer, {"ok": False, "error": "中转服务器上未找到该验证码对应的在线设备"})
                 return True
             self.fail_state.pop(ip, None)
         else:
-            await write_frame(writer, {"ok": False, "error": "缺少目标设备或验证码"})
+            await write_frame(writer, {"ok": False, "error": "缺少目标设备或路由索引"})
             return True
 
         stream_id = secrets.token_hex(12)
@@ -225,7 +227,6 @@ class RelayServer:
         pt.target_reader = reader
         pt.target_writer = writer
         pt.joined.set()
-        # 连接的所有权移交给 _handle_tunnel_open 的 _bridge 协程
         return False
 
     async def _bridge(self, r1, w1, r2, w2):
@@ -256,23 +257,30 @@ class RelayServer:
                     pass
 
 
-async def run_server(host: str, port: int, key: str):
+async def run_server(host: str, port: int, key: str, cert: str, keyfile: str):
     relay = RelayServer(server_key=key)
-    srv = await asyncio.start_server(relay.handle_client, host, port)
+    ssl_ctx = None
+    if cert and keyfile:
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(cert, keyfile)
+    srv = await asyncio.start_server(relay.handle_client, host, port, ssl=ssl_ctx)
     addrs = ", ".join(str(s.getsockname()) for s in srv.sockets)
-    log.info("LanFast 中转服务器已启动：%s  (密钥保护：%s)", addrs, "开启" if key else "关闭")
+    log.info("LanFast v5 中转服务器已启动：%s  (TLS：%s，密钥保护：%s)",
+             addrs, "开启" if ssl_ctx else "关闭", "开启" if key else "关闭")
     async with srv:
         await srv.serve_forever()
 
 
 def main():
-    p = argparse.ArgumentParser(description="LanFast 公网中转服务器")
+    p = argparse.ArgumentParser(description="LanFast v5 公网中转服务器（零明文 PIN 路由 + 可选 TLS）")
     p.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
     p.add_argument("--port", type=int, default=53532, help="监听端口（默认 53532）")
-    p.add_argument("--key", default="", help="可选接入密钥，设置后只有填了相同密钥的客户端能连上本中转")
+    p.add_argument("--key", default="", help="可选接入密钥，客户端需填写相同密钥")
+    p.add_argument("--cert", default="", help="可选 TLS 证书文件（PEM），配置后客户端用 tls://host:port 连接")
+    p.add_argument("--keyfile", default="", help="可选 TLS 私钥文件（PEM）")
     args = p.parse_args()
     try:
-        asyncio.run(run_server(args.host, args.port, args.key))
+        asyncio.run(run_server(args.host, args.port, args.key, args.cert, args.keyfile))
     except KeyboardInterrupt:
         log.info("中转服务器已停止")
 

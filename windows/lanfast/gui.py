@@ -127,7 +127,7 @@ class RelayDialog(tk.Toplevel):
                              "也能直接用 6 位验证码加好友并互传文件；在同一局域网时仍优先走内网直连。",
                   foreground="#475569", justify="left").pack(anchor="w", pady=(0, 10))
 
-        ttk.Label(body, text="服务器地址（格式 IP:端口 或 域名:端口，留空表示仅局域网）：").pack(anchor="w")
+        ttk.Label(body, text="服务器地址（IP:端口，开启 TLS 时填 tls://域名:端口，留空仅局域网）：").pack(anchor="w")
         self.addr_var = tk.StringVar(value=addr)
         e = ttk.Entry(body, textvariable=self.addr_var, width=42)
         e.pack(fill="x", pady=(4, 10))
@@ -440,8 +440,11 @@ class App:
             self.chat_header.config(text="未选择好友对话 — 请先点击左侧「添加好友」或用浏览器访问网页端")
             return
         loc = d.ip if d.ip else "公网中转"
-        mode_tag = "🌐 网页直连" if d.os == "web" else "🔒 AES-256-GCM 端到端加密"
-        self.chat_header.config(text=f"{mode_tag}：{d.label()}    ·    ({loc})")
+        if d.os == "web":
+            mode_tag = f"🌐 网页端 (安全码 {d.sas})" if d.sas else "🌐 网页直连"
+        else:
+            mode_tag = f"🔒 SPAKE2+AES256 · 安全码 {d.sas}" if d.sas else "🔒 AES-256-GCM 端到端加密"
+        self.chat_header.config(text=f"{mode_tag}：{d.label()}  ({loc})")
         for rec in self.chats.get(d.id, []):
             self._insert_tree_row(rec)
 

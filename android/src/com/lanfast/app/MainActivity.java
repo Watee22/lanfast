@@ -395,7 +395,8 @@ public class MainActivity extends Activity implements Core.Listener {
         if (inChat) {
             Core.Device d = core.friend(activePeerId);
             chatTitle.setText(d.label());
-            chatSub.setText("🔒 AES-256-GCM 端到端加密  ·  " + d.loc());
+            String sasTag = (d.sas != null && !d.sas.isEmpty()) ? ("安全码 " + d.sas + " · ") : "";
+            chatSub.setText("🔒 " + sasTag + "SPAKE2+AES256 · " + d.loc());
             core.unread.remove(activePeerId);
             msgAdapter.notifyDataSetChanged();
             if (!pending.isEmpty()) sendPendingTo(d);
@@ -524,7 +525,7 @@ public class MainActivity extends Activity implements Core.Listener {
         box.addView(l1);
 
         final EditText eAddr = new EditText(this);
-        eAddr.setHint("例如 1.2.3.4:53532");
+        eAddr.setHint("IP:端口 或 tls://域名:端口");
         eAddr.setSingleLine(true);
         eAddr.setText(core.relayAddr);
         box.addView(eAddr);

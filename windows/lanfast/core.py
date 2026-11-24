@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import socket
+import ssl
 import struct
 import sys
 import threading
@@ -23,7 +24,7 @@ from . import crypto
 from .web import WEB_PORT, WebBridge
 
 APP = "lanfast"
-PROTO_VERSION = 4
+PROTO_VERSION = 5
 DISCOVERY_PORT = 53530
 TRANSFER_PORT = 53531
 DEFAULT_RELAY_PORT = 53532
@@ -44,16 +45,31 @@ def generate_pin():
 
 
 def parse_relay_addr(addr):
+    """解析 'host:port'、'tls://host:port' 或 'host'，返回 (host, port, use_tls) 或 None。"""
     s = (addr or "").strip()
     if not s:
         return None
+    use_tls = False
+    if s.lower().startswith("tls://"):
+        use_tls = True
+        s = s[6:]
+    elif s.lower().startswith("tcp://"):
+        s = s[6:]
     if ":" in s:
         host, port_s = s.rsplit(":", 1)
         try:
-            return host.strip(), int(port_s.strip())
+            return host.strip(), int(port_s.strip()), use_tls
         except ValueError:
-            return host.strip(), DEFAULT_RELAY_PORT
-    return s, DEFAULT_RELAY_PORT
+            return host.strip(), DEFAULT_RELAY_PORT, use_tls
+    return s, DEFAULT_RELAY_PORT, use_tls
+
+
+def connect_relay_socket(host, port, use_tls, timeout=8):
+    s = socket.create_connection((host, port), timeout=timeout)
+    if use_tls:
+        ctx = ssl.create_default_context()
+        s = ctx.wrap_socket(s, server_hostname=host)
+    return s
 
 
 def _is_clash_tun(ip):
@@ -197,10 +213,11 @@ def recv_frame(sock):
 
 # ----------------------------------------------------------------- 数据结构
 class Device:
-    def __init__(self, id, name, os_, ip, port, token="", key=b"", boot_id="", via_relay=False):
+    def __init__(self, id, name, os_, ip, port, token="", key=b"", sas="", boot_id="", via_relay=False):
         self.id, self.name, self.os, self.ip, self.port = id, name, os_, ip, port
         self.token = token
         self.key = key          # 32 字节 AES-256-GCM 端到端会话密钥
+        self.sas = sas          # 4 位 Emoji 安全核对码（防主动 MITM）
         self.boot_id = boot_id
         self.via_relay = via_relay
         self.last_seen = time.time()
@@ -338,7 +355,7 @@ class LanFastCore:
             self._emit("relay_state", {"connected": False, "text": "仅局域网（未配置中转）"})
             return
         g = self._relay_gen
-        threading.Thread(target=self._relay_loop, args=(g, parsed[0], parsed[1], self.relay_key),
+        threading.Thread(target=self._relay_loop, args=(g, parsed[0], parsed[1], parsed[2], self.relay_key),
                          daemon=True).start()
 
     def _send_relay_update(self):
@@ -348,20 +365,21 @@ class LanFastCore:
         try:
             with self._relay_send_lock:
                 send_frame(s, {"app": APP, "type": "relay_update",
-                               "pin": self.pin, "name": self.name, "boot": self.boot_id})
+                               "pin_tag": crypto.pin_route_tag(self.pin, self.relay_key),
+                               "name": self.name, "boot": self.boot_id})
         except OSError:
             pass
 
-    def _relay_loop(self, g, host, port, key):
+    def _relay_loop(self, g, host, port, use_tls, key):
         while self._running and self._relay_gen == g:
             self._emit("relay_state", {"connected": False, "text": f"正在连接中转 {host}:{port}…"})
             s = None
             try:
-                s = socket.create_connection((host, port), timeout=8)
+                s = connect_relay_socket(host, port, use_tls, timeout=8)
                 s.settimeout(25)
                 reg = {"app": APP, "type": "relay_register", "key": key,
                        "id": self.id, "name": self.name, "os": OS_NAME,
-                       "pin": self.pin, "boot": self.boot_id}
+                       "pin_tag": crypto.pin_route_tag(self.pin, key), "boot": self.boot_id}
                 send_frame(s, reg)
                 ack = recv_frame(s)
                 if not ack or not ack.get("ok"):
@@ -372,7 +390,8 @@ class LanFastCore:
                     continue
                 self._relay_sock = s
                 self.relay_connected = True
-                self._emit("relay_state", {"connected": True, "text": f"中转已连接 ({host}:{port})"})
+                tag_tls = "TLS " if use_tls else ""
+                self._emit("relay_state", {"connected": True, "text": f"{tag_tls}中转已连接 ({host}:{port})"})
                 while self._running and self._relay_gen == g:
                     try:
                         msg = recv_frame(s)
@@ -382,7 +401,7 @@ class LanFastCore:
                             sid = msg.get("streamId", "")
                             if sid:
                                 threading.Thread(target=self._join_relay_tunnel,
-                                                 args=(host, port, key, sid), daemon=True).start()
+                                                 args=(host, port, use_tls, key, sid), daemon=True).start()
                     except socket.timeout:
                         with self._relay_send_lock:
                             send_frame(s, {"app": APP, "type": "relay_ping"})
@@ -401,9 +420,9 @@ class LanFastCore:
                 self._emit("relay_state", {"connected": False, "text": "中转断开，正在重连…"})
                 time.sleep(4)
 
-    def _join_relay_tunnel(self, host, port, key, stream_id):
+    def _join_relay_tunnel(self, host, port, use_tls, key, stream_id):
         try:
-            s = socket.create_connection((host, port), timeout=8)
+            s = connect_relay_socket(host, port, use_tls, timeout=8)
             s.settimeout(15)
             send_frame(s, {"app": APP, "type": "tunnel_join", "key": key, "streamId": stream_id})
             ack = recv_frame(s)
@@ -418,14 +437,14 @@ class LanFastCore:
         parsed = parse_relay_addr(self.relay_addr)
         if not parsed:
             raise ConnectionError("未配置公网中转服务器")
-        host, port = parsed
-        s = socket.create_connection((host, port), timeout=8)
+        host, port, use_tls = parsed
+        s = connect_relay_socket(host, port, use_tls, timeout=8)
         s.settimeout(20)
         req = {"app": APP, "type": "tunnel_open", "key": self.relay_key, "from": self.id}
         if to_id:
             req["to"] = to_id
         if pin:
-            req["pin"] = pin
+            req["pin_tag"] = crypto.pin_route_tag(pin, self.relay_key)
         send_frame(s, req)
         ack = recv_frame(s)
         if not ack or not ack.get("ok"):
@@ -543,13 +562,13 @@ class LanFastCore:
     def refresh(self):
         threading.Thread(target=self._broadcast, daemon=True).start()
 
-    def register_web_device(self, device_id, name, ip, token):
-        dev = Device(device_id, name, "web", ip, self.web_port or 0, token=token)
+    def register_web_device(self, device_id, name, ip, token, sas=""):
+        dev = Device(device_id, name, "web", ip, self.web_port or 0, token=token, sas=sas)
         with self._lock:
             self.paired[device_id] = dev
         self._emit("devices", self.device_list())
         self._emit("paired", dev)
-        self._emit("log", f"🌐 网页设备 {name} ({ip}) 已通过 6 位验证码连接")
+        self._emit("log", f"🌐 网页设备 {name} ({ip}) 已通过 SPAKE2 验证连接（安全码 {sas}）")
 
     def remove_device(self, device_id):
         with self._lock:
@@ -558,38 +577,35 @@ class LanFastCore:
             self.web.kick(device_id)
         self._emit("devices", self.device_list())
 
-    # ---------- 端到端加密配对（ECDH P-256 + 零明文 6 位验证码证明）
+    # ---------- RFC 9382 SPAKE2-P256 抗主动中间人配对（杜绝离线穷举 6 位验证码）
     def _do_pair_over_socket(self, s, pin, ip, port, via_relay):
-        priv_a, pub_a_b64 = crypto.gen_ec_keypair()
-        salt_a = os.urandom(16)
-        hello = self._me("pair_hello")
-        hello["pub"] = pub_a_b64
-        hello["salt"] = crypto.b64e(salt_a)
+        sp = crypto.Spake2Initiator(self.id, pin)
+        hello = self._me("spake_hello")
+        hello["pA"] = sp.pA_b64()
         send_frame(s, hello)
 
-        chal = recv_frame(s)
-        if not chal or not chal.get("ok") or not chal.get("pub") or not chal.get("salt"):
-            return False, None, (chal or {}).get("error", "对方不支持端到端加密或拒绝连接")
+        reply = recv_frame(s)
+        if not reply or not reply.get("ok") or not reply.get("pB") or not reply.get("id"):
+            return False, None, (reply or {}).get("error", "对方版本过旧，请升级两端至 v5 (SPAKE2)")
 
-        salt_b = crypto.b64d(chal["salt"])
-        shared_z = crypto.ecdh_secret(priv_a, chal["pub"])
-        proof = crypto.pin_proof(shared_z, pin, salt_a, salt_b)
-        aes_key = crypto.derive_session_key(shared_z, pin, salt_a, salt_b)
+        aes_key, conf_a, conf_b, sas = sp.finish(reply["id"], reply["pB"])
+        send_frame(s, {"app": APP, "v": PROTO_VERSION, "type": "spake_confirm", "confA": conf_a})
 
-        send_frame(s, {"app": APP, "v": PROTO_VERSION, "type": "pair_verify", "proof": proof})
         ack = recv_frame(s)
         if not ack or not ack.get("ok") or not ack.get("n") or not ack.get("ct"):
             return False, None, (ack or {}).get("error", "验证码错误")
 
-        secret_box = crypto.decrypt_json(aes_key, ack["n"], ack["ct"], b"pair_ok")
-        token = secret_box.get("token", "")
-        if not token or not chal.get("id"):
+        box = crypto.decrypt_json(aes_key, ack["n"], ack["ct"], b"spake_ok")
+        if not hmac.compare_digest(str(box.get("confB", "")), conf_b):
+            return False, None, "双向密钥确认失败（疑似中间人攻击）"
+        token = box.get("token", "")
+        if not token:
             return False, None, "配对令牌校验失败"
 
         dev = Device(
-            chal["id"], chal.get("name", ip or "好友"), chal.get("os", "?"),
-            "" if via_relay else ip, int(chal.get("port", port)),
-            token=token, key=aes_key, boot_id=chal.get("boot", ""), via_relay=via_relay,
+            reply["id"], reply.get("name", ip or "好友"), reply.get("os", "?"),
+            "" if via_relay else ip, int(reply.get("port", port)),
+            token=token, key=aes_key, sas=sas, boot_id=reply.get("boot", ""), via_relay=via_relay,
         )
         return True, dev, None
 
@@ -668,7 +684,7 @@ class LanFastCore:
         self._emit("pair_result", {"ok": True, "device": dev, "route": route})
         self._emit("log", f"🔒 已建立端到端加密好友连接：{dev.name}（{route}）")
 
-    # ---------- 服务端 E2EE 配对处理
+    # ---------- 服务端 SPAKE2-P256 配对处理
     def _handle_pair_handshake(self, conn, hello, ip, via_relay):
         now = time.time()
         rate_key = ip or ("relay:" + str(hello.get("id", "?")))
@@ -678,30 +694,32 @@ class LanFastCore:
                 wait = int(lock_until - now) + 1
                 send_frame(conn, {"ok": False, "error": f"验证码尝试次数过多，请 {wait} 秒后再试"})
                 return
+            pin_now = self.pin
         did = hello.get("id", "")
-        if not did or did == self.id or not hello.get("pub") or not hello.get("salt"):
-            send_frame(conn, {"ok": False, "error": "无效的加密握手请求"})
+        pA_b64 = hello.get("pA", "")
+        if not did or did == self.id or not pA_b64:
+            send_frame(conn, {"ok": False, "error": "无效的 SPAKE2 握手请求"})
             return
 
-        priv_b, pub_b_b64 = crypto.gen_ec_keypair()
-        salt_a = crypto.b64d(hello["salt"])
-        salt_b = os.urandom(16)
-        shared_z = crypto.ecdh_secret(priv_b, hello["pub"])
+        sp = crypto.Spake2Responder(self.id, pin_now)
+        try:
+            aes_key, expected_a, conf_b, sas = sp.finish(did, pA_b64)
+        except Exception:
+            send_frame(conn, {"ok": False, "error": "无效的椭圆曲线点"})
+            return
 
-        chal = self._me("pair_challenge")
-        chal["ok"] = True
-        chal["pub"] = pub_b_b64
-        chal["salt"] = crypto.b64e(salt_b)
-        send_frame(conn, chal)
+        reply = self._me("spake_reply")
+        reply["ok"] = True
+        reply["pB"] = sp.pB_b64()
+        send_frame(conn, reply)
 
         ver = recv_frame(conn)
-        if not ver or ver.get("type") != "pair_verify":
+        if not ver or ver.get("type") != "spake_confirm":
             return
 
-        expected = crypto.pin_proof(shared_z, self.pin, salt_a, salt_b)
-        got = str(ver.get("proof", ""))
+        got_a = str(ver.get("confA", ""))
         with self._lock:
-            if not hmac.compare_digest(got, expected):
+            if not hmac.compare_digest(got_a, expected_a):
                 fails, _ = self._fail_state.get(rate_key, (0, 0.0))
                 fails += 1
                 if fails >= MAX_PIN_FAILS:
@@ -712,21 +730,20 @@ class LanFastCore:
                     send_frame(conn, {"ok": False, "error": "验证码错误"})
                 return
             self._fail_state.pop(rate_key, None)
-            aes_key = crypto.derive_session_key(shared_z, self.pin, salt_a, salt_b)
             token = secrets.token_hex(24)
             lan_dev = self._discovered.get(did)
             peer_ip = (lan_dev.ip if lan_dev else "") if via_relay else ip
             peer_port = int(hello.get("port", TRANSFER_PORT))
             dev = Device(did, hello.get("name", ip or "好友"), hello.get("os", "?"),
-                         peer_ip, peer_port, token=token, key=aes_key,
+                         peer_ip, peer_port, token=token, key=aes_key, sas=sas,
                          boot_id=hello.get("boot", ""), via_relay=(not peer_ip))
             self.paired[did] = dev
 
-        n_b64, ct_b64 = crypto.encrypt_json(aes_key, {"token": token}, b"pair_ok")
-        send_frame(conn, {"ok": True, "type": "pair_ok", "n": n_b64, "ct": ct_b64})
+        n_b64, ct_b64 = crypto.encrypt_json(aes_key, {"token": token, "confB": conf_b}, b"spake_ok")
+        send_frame(conn, {"ok": True, "type": "spake_ok", "n": n_b64, "ct": ct_b64})
         self._emit("devices", self.device_list())
         self._emit("paired", dev)
-        self._emit("log", f"🔒 {dev.name} 已通过端到端加密验证加为好友（{'公网中转' if via_relay else '局域网直连'}）")
+        self._emit("log", f"🔒 {dev.name} 已通过 SPAKE2 抗中间人验证加为好友（安全码 {sas}）")
 
     # ---------- 接收端（只接受 AES-256-GCM 密文帧）
     def _serve_loop(self):
@@ -757,7 +774,7 @@ class LanFastCore:
                         ack = self._me("pong")
                         ack["ok"] = True
                         send_frame(conn, ack)
-                    elif t == "pair_hello":
+                    elif t == "spake_hello":
                         self._handle_pair_handshake(conn, hdr, ip, via_relay)
                         break
                     elif t == "enc":

@@ -342,6 +342,28 @@ function createPeer(connId, peerId, name, initiator) {
   return p;
 }
 
+const SAS_EMOJIS = ["🐶","🐱","🦊","🐻","🐼","🐨","🐯","🦁","🐮","🐷","🐸","🐵","🐔","🐧","🐦","🦆","🦉","🦇","🐺","🐴","🦄","🐝","🦋","🐌","🐞","🐢","🐍","🐙","🐠","🐳","🐬","🦈","🌵","🌲","🌸","🌻","🍀","🍁","🍎","🍊","🍋","🍉","🍇","🍓","🍒","🍑","🍍","🥑","🍕","🍔","🍟","🍩","🍪","🎂","⚽","🏀","🎸","🎹","🚀","✈️","🚗","⛵","⭐","🔥"];
+
+function extractDtlsFp(sdp) {
+  const m = (sdp || "").match(/a=fingerprint:\S+\s+([0-9A-Fa-f:]+)/);
+  return m ? m[1].toUpperCase() : "";
+}
+function dtlsSasEmoji(pc) {
+  const f1 = extractDtlsFp(pc.localDescription && pc.localDescription.sdp);
+  const f2 = extractDtlsFp(pc.remoteDescription && pc.remoteDescription.sdp);
+  if (!f1 || !f2) return "";
+  const pair = [f1, f2].sort().join("|");
+  // 双哈希生成 4 个确定性 Emoji（无需 crypto.subtle，两端独立从 DTLS 证书指纹导出）
+  let h1 = 0x811c9dc5, h2 = 0x243f6a88;
+  for (let i = 0; i < pair.length; i++) {
+    const c = pair.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b) >>> 0;
+  }
+  const bytes = [h1 & 63, (h1 >>> 8) & 63, h2 & 63, (h2 >>> 8) & 63];
+  return bytes.map(i => SAS_EMOJIS[i]).join("");
+}
+
 async function inspectRoute(p) {
   try {
     const stats = await p.pc.getStats();
@@ -352,9 +374,11 @@ async function inspectRoute(p) {
         if (lc) localType = lc.candidateType || "";
       }
     });
+    const sas = dtlsSasEmoji(p.pc);
+    const sasTag = sas ? `安全码 ${sas} · ` : "";
     p.route = localType === "host"
-      ? "🔒 局域网 P2P 直连（DTLS 加密 · 0 服务器流量）"
-      : "🔒 WebRTC P2P 直连（DTLS 加密 · 0 服务器流量）";
+      ? `🔒 ${sasTag}局域网 P2P 直连（0 服务器流量）`
+      : `🔒 ${sasTag}WebRTC P2P 直连（0 服务器流量）`;
     if (activeConnId === p.connId) $("chatSub").textContent = p.route;
   } catch (e) {}
 }

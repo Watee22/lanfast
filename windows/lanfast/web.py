@@ -16,6 +16,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from . import crypto
+
 WEB_PORT = 53533
 UPLOAD_CHUNK = 512 * 1024
 
@@ -137,7 +139,142 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <script>
 const $ = id => document.getElementById(id);
-let state = { token: "", clientId: "", peerName: "", es: null };
+let state = { token: "", clientId: "", peerName: "", sas: "", es: null };
+
+// ---- 纯 JS SHA-256 / HMAC-SHA256 / RFC 9382 SPAKE2-P256（不依赖 crypto.subtle，HTTP 下也能零明文校验 6 位码）
+const _K256 = [
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+];
+function sha256Bytes(msg) {
+  const l = msg.length, bitLen = l * 8;
+  const padLen = ((l + 9 + 63) & ~63);
+  const b = new Uint8Array(padLen); b.set(msg); b[l] = 0x80;
+  const dv = new DataView(b.buffer);
+  dv.setUint32(padLen - 8, Math.floor(bitLen / 0x100000000), false);
+  dv.setUint32(padLen - 4, bitLen >>> 0, false);
+  let H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const W = new Uint32Array(64);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let o = 0; o < padLen; o += 64) {
+    for (let i = 0; i < 16; i++) W[i] = dv.getUint32(o + i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(W[i-15], 7) ^ rotr(W[i-15], 18) ^ (W[i-15] >>> 3);
+      const s1 = rotr(W[i-2], 17) ^ rotr(W[i-2], 19) ^ (W[i-2] >>> 10);
+      W[i] = (W[i-16] + s0 + W[i-7] + s1) >>> 0;
+    }
+    let [a,b0,c,d,e,f,g,h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ ((~e) & g);
+      const t1 = (h + S1 + ch + _K256[i] + W[i]) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b0) ^ (a & c) ^ (b0 & c);
+      const t2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b0; b0 = a; a = (t1 + t2) >>> 0;
+    }
+    H = [(H[0]+a)>>>0,(H[1]+b0)>>>0,(H[2]+c)>>>0,(H[3]+d)>>>0,(H[4]+e)>>>0,(H[5]+f)>>>0,(H[6]+g)>>>0,(H[7]+h)>>>0];
+  }
+  const out = new Uint8Array(32), od = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) od.setUint32(i * 4, H[i], false);
+  return out;
+}
+function concatBytes(...arrs) {
+  let n = 0; for (const a of arrs) n += a.length;
+  const r = new Uint8Array(n); let o = 0;
+  for (const a of arrs) { r.set(a, o); o += a.length; }
+  return r;
+}
+function utf8(s) { return new TextEncoder().encode(s); }
+function toHex(b) { return Array.from(b).map(x => x.toString(16).padStart(2, "0")).join(""); }
+function b64e(b) { let s = ""; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s); }
+function b64d(s) { const bin = atob(s); const b = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i); return b; }
+function hmacSha256Hex(key, msg) {
+  let k = key.length > 64 ? sha256Bytes(key) : key;
+  const pad = new Uint8Array(64); pad.set(k);
+  const ip = new Uint8Array(64), op = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) { ip[i] = pad[i] ^ 0x36; op[i] = pad[i] ^ 0x5c; }
+  return toHex(sha256Bytes(concatBytes(op, sha256Bytes(concatBytes(ip, msg)))));
+}
+function u32be(n) { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, false); return b; }
+function bigTo32(x) {
+  const b = new Uint8Array(32);
+  let v = x;
+  for (let i = 31; i >= 0; i--) { b[i] = Number(v & 0xffn); v >>= 8n; }
+  return b;
+}
+function bytesToBig(b) { let v = 0n; for (const x of b) v = (v << 8n) | BigInt(x); return v; }
+
+const _P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn;
+const _A = _P - 3n;
+const _B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn;
+const _N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+const _G = [0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n, 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n];
+const _M = [0x886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12fn, 0x5ff355163e43ce224e0b0e65ff02ac8e5c7be09419c785e0ca547d55a12e2d20n];
+const _NPT = [0xd8bbd6c639c62937b04d997f38c3770719c629d7014d49a24b4f98baa1292b49n, 0x07d60aa6bfade45008a636337f5168c64d9bd36034808cd564490b1e656edbe7n];
+const SAS_EMOJIS = ["🐶","🐱","🦊","🐻","🐼","🐨","🐯","🦁","🐮","🐷","🐸","🐵","🐔","🐧","🐦","🦆","🦉","🦇","🐺","🐴","🦄","🐝","🦋","🐌","🐞","🐢","🐍","🐙","🐠","🐳","🐬","🦈","🌵","🌲","🌸","🌻","🍀","🍁","🍎","🍊","🍋","🍉","🍇","🍓","🍒","🍑","🍍","🥑","🍕","🍔","🍟","🍩","🍪","🎂","⚽","🏀","🎸","🎹","🚀","✈️","🚗","⛵","⭐","🔥"];
+
+function mod(x, m = _P) { const r = x % m; return r >= 0n ? r : r + m; }
+function modInv(a, m = _P) {
+  let t = 0n, nt = 1n, r = m, nr = mod(a, m);
+  while (nr !== 0n) { const q = r / nr; [t, nt] = [nt, t - q * nt]; [r, nr] = [nr, r - q * nr]; }
+  return mod(t, m);
+}
+function ptAdd(p1, p2) {
+  if (!p1) return p2; if (!p2) return p1;
+  const [x1, y1] = p1, [x2, y2] = p2;
+  let lam;
+  if (x1 === x2) {
+    if (mod(y1 + y2) === 0n) return null;
+    lam = mod((3n * x1 * x1 + _A) * modInv(2n * y1));
+  } else {
+    lam = mod((y2 - y1) * modInv(x2 - x1));
+  }
+  const x3 = mod(lam * lam - x1 - x2);
+  return [x3, mod(lam * (x1 - x3) - y1)];
+}
+function ptSub(p1, p2) { return ptAdd(p1, p2 ? [p2[0], mod(-p2[1])] : null); }
+function ptMul(k, pt) {
+  let r = null, add = pt, v = mod(k, _N);
+  while (v > 0n) { if (v & 1n) r = ptAdd(r, add); add = ptAdd(add, add); v >>= 1n; }
+  return r;
+}
+function encPt(pt) { return concatBytes(new Uint8Array([4]), bigTo32(pt[0]), bigTo32(pt[1])); }
+function decPt(raw) {
+  if (raw.length !== 65 || raw[0] !== 4) throw new Error("bad point");
+  const x = bytesToBig(raw.slice(1, 33)), y = bytesToBig(raw.slice(33, 65));
+  if (mod(y * y - (x * x * x + _A * x + _B)) !== 0n) throw new Error("not on curve");
+  return [x, y];
+}
+function randScalar() {
+  const b = new Uint8Array(32); crypto.getRandomValues(b);
+  return (bytesToBig(b) % (_N - 1n)) + 1n;
+}
+function spakeStart(clientId, pin) {
+  const w = (bytesToBig(sha256Bytes(utf8("lanfast-spake2-w|" + pin))) % (_N - 1n)) + 1n;
+  const x = randScalar();
+  const pARaw = encPt(ptAdd(ptMul(x, _G), ptMul(w, _M)));
+  return {
+    pAB64: b64e(pARaw),
+    finish(serverId, pBB64) {
+      const pBRaw = b64d(pBB64);
+      const K = ptMul(x, ptSub(decPt(pBRaw), ptMul(w, _NPT)));
+      const aB = utf8(clientId), bB = utf8(serverId);
+      const tt = sha256Bytes(concatBytes(u32be(aB.length), aB, u32be(bB.length), bB, pARaw, pBRaw, encPt(K), bigTo32(w)));
+      const confA = hmacSha256Hex(tt, utf8("confirm-A"));
+      const confB = hmacSha256Hex(tt, utf8("confirm-B"));
+      const sd = sha256Bytes(concatBytes(tt, utf8("sas-emoji")));
+      const sas = [0,1,2,3].map(i => SAS_EMOJIS[sd[i] & 63]).join("");
+      return { confA, confB, sas };
+    }
+  };
+}
 
 function guessDeviceName() {
   const ua = navigator.userAgent || "";
@@ -281,7 +418,7 @@ async function initInfo() {
       const chk = await fetch("/api/check?token=" + encodeURIComponent(s.token));
       const cd = await chk.json();
       if (cd.ok) {
-        enterChat(s.token, s.clientId, cd.name || s.peerName);
+        enterChat(s.token, s.clientId, cd.name || s.peerName, s.sas || "");
         return;
       }
     } catch (e) {}
@@ -299,20 +436,32 @@ async function doLogin() {
   localStorage.setItem("lf_web_name", name);
   $("loginErr").textContent = "";
   $("loginBtn").disabled = true;
-  $("loginBtn").textContent = "正在验证…";
+  $("loginBtn").textContent = "SPAKE2 安全校验中…";
   try {
-    const r = await fetch("/api/pair", {
+    const cid = "web-" + toHex(crypto.getRandomValues(new Uint8Array(8)));
+    const sp = spakeStart(cid, pin);
+    const r1 = await fetch("/api/spake/hello", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: pin, name })
+      body: JSON.stringify({ id: cid, name, pA: sp.pAB64 })
     });
-    const d = await r.json();
-    if (!d.ok) {
-      $("loginErr").textContent = d.error || "验证码错误";
+    const d1 = await r1.json();
+    if (!d1.ok) { $("loginErr").textContent = d1.error || "握手失败"; return; }
+    const { confA, confB, sas } = sp.finish(d1.serverId, d1.pB);
+    const r2 = await fetch("/api/spake/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ hsId: d1.hsId, confA })
+    });
+    const d2 = await r2.json();
+    if (!d2.ok) {
+      $("loginErr").textContent = d2.error || "验证码错误";
+    } else if (d2.confB !== confB) {
+      $("loginErr").textContent = "双向校验失败（疑似中间人攻击）";
     } else {
       $("pinInput").value = "";
-      sessionStorage.setItem("lf_session", JSON.stringify({ token: d.token, clientId: d.clientId, peerName: d.name }));
-      enterChat(d.token, d.clientId, d.name);
+      sessionStorage.setItem("lf_session", JSON.stringify({ token: d2.token, clientId: cid, peerName: d2.name, sas }));
+      enterChat(d2.token, cid, d2.name, sas);
     }
   } catch (e) {
     $("loginErr").textContent = "连接失败：" + e.message;
@@ -322,9 +471,9 @@ async function doLogin() {
   }
 }
 
-function enterChat(token, clientId, peerName) {
-  state.token = token; state.clientId = clientId; state.peerName = peerName;
-  $("peerTitle").textContent = "✓ 已连接：" + peerName;
+function enterChat(token, clientId, peerName, sas) {
+  state.token = token; state.clientId = clientId; state.peerName = peerName; state.sas = sas || "";
+  $("peerTitle").textContent = "✓ 已连接：" + peerName + (sas ? "  ·  " + sas : "");
   $("loginView").classList.add("hidden");
   $("chatView").classList.remove("hidden");
   startEvents();
@@ -494,6 +643,7 @@ class WebBridge:
         self._lock = threading.Lock()
         self._by_token = {}  # token -> WebClient
         self._by_id = {}     # device_id -> WebClient
+        self._pending_hs = {}  # hsId -> dict
         self._srv = None
 
     def start(self):
@@ -615,7 +765,7 @@ class WebBridge:
                 path = parsed.path
                 ip = self.client_address[0]
 
-                if path == "/api/pair":
+                if path == "/api/spake/hello":
                     cl = int(self.headers.get("Content-Length", "0"))
                     if cl <= 0 or cl > 65536:
                         self._send_json({"ok": False, "error": "请求无效"}, 400)
@@ -625,9 +775,30 @@ class WebBridge:
                     except ValueError:
                         self._send_json({"ok": False, "error": "JSON 格式错误"}, 400)
                         return
-                    code = str(body.get("code", "")).strip()
-                    name = str(body.get("name", "网页设备")).strip()[:32] or "网页设备"
-                    ok, res = bridge.handle_pair(code, name, ip)
+                    ok, res = bridge.handle_spake_hello(
+                        str(body.get("id", "")).strip(),
+                        str(body.get("name", "网页设备")).strip()[:32] or "网页设备",
+                        str(body.get("pA", "")).strip(),
+                        ip,
+                    )
+                    self._send_json(res, 200 if ok else 400)
+                    return
+
+                if path == "/api/spake/confirm":
+                    cl = int(self.headers.get("Content-Length", "0"))
+                    if cl <= 0 or cl > 65536:
+                        self._send_json({"ok": False, "error": "请求无效"}, 400)
+                        return
+                    try:
+                        body = json.loads(self.rfile.read(cl).decode("utf-8"))
+                    except ValueError:
+                        self._send_json({"ok": False, "error": "JSON 格式错误"}, 400)
+                        return
+                    ok, res = bridge.handle_spake_confirm(
+                        str(body.get("hsId", "")).strip(),
+                        str(body.get("confA", "")).strip(),
+                        ip,
+                    )
                     self._send_json(res, 200 if ok else 403)
                     return
 
@@ -724,7 +895,7 @@ class WebBridge:
         with self._lock:
             return self._by_token.get(tok)
 
-    def handle_pair(self, code, name, ip):
+    def handle_spake_hello(self, cid, name, pA_b64, ip):
         now = time.time()
         rate_key = "web:" + ip
         with self.core._lock:
@@ -732,7 +903,38 @@ class WebBridge:
             if now < lock_until:
                 wait = int(lock_until - now) + 1
                 return False, {"ok": False, "error": f"验证码尝试次数过多，请 {wait} 秒后再试"}
-            if not code or not hmac.compare_digest(code, self.core.pin):
+            pin_now = self.core.pin
+        if not cid or not pA_b64:
+            return False, {"ok": False, "error": "握手参数不完整"}
+        sp = crypto.Spake2Responder(self.core.id, pin_now)
+        try:
+            _aes_key, conf_a, conf_b, sas = sp.finish(cid, pA_b64)
+        except Exception:
+            return False, {"ok": False, "error": "无效的曲线参数"}
+        hs_id = secrets.token_hex(12)
+        with self._lock:
+            # 清理过期握手
+            for k in [k for k, v in self._pending_hs.items() if now > v["exp"]]:
+                del self._pending_hs[k]
+            self._pending_hs[hs_id] = {
+                "cid": cid, "name": name, "ip": ip,
+                "confA": conf_a, "confB": conf_b, "sas": sas, "exp": now + 60,
+            }
+        return True, {"ok": True, "hsId": hs_id, "serverId": self.core.id, "pB": sp.pB_b64()}
+
+    def handle_spake_confirm(self, hs_id, conf_a, ip):
+        now = time.time()
+        rate_key = "web:" + ip
+        with self._lock:
+            hs = self._pending_hs.pop(hs_id, None)
+        if not hs or now > hs["exp"]:
+            return False, {"ok": False, "error": "握手已超时，请重试"}
+        with self.core._lock:
+            fails, lock_until = self.core._fail_state.get(rate_key, (0, 0.0))
+            if now < lock_until:
+                wait = int(lock_until - now) + 1
+                return False, {"ok": False, "error": f"验证码尝试次数过多，请 {wait} 秒后再试"}
+            if not hmac.compare_digest(conf_a, hs["confA"]):
                 fails += 1
                 if fails >= 5:
                     self.core._fail_state[rate_key] = (0, now + 30)
@@ -742,13 +944,14 @@ class WebBridge:
             self.core._fail_state.pop(rate_key, None)
 
         token = secrets.token_hex(24)
-        cid = "web-" + secrets.token_hex(8)
-        cli = WebClient(cid, name, ip, token)
+        cid = hs["cid"]
+        cli = WebClient(cid, hs["name"], ip, token)
         with self._lock:
             self._by_token[token] = cli
             self._by_id[cid] = cli
-        self.core.register_web_device(cid, name, ip, token)
-        return True, {"ok": True, "token": token, "clientId": cid, "name": self.core.name}
+        self.core.register_web_device(cid, hs["name"], ip, token, sas=hs["sas"])
+        return True, {"ok": True, "token": token, "clientId": cid, "name": self.core.name,
+                      "confB": hs["confB"], "sas": hs["sas"]}
 
     def kick(self, device_id, reason="电脑端已断开连接"):
         with self._lock:
