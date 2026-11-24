@@ -20,6 +20,7 @@ import time
 import uuid
 
 from . import crypto
+from .web import WEB_PORT, WebBridge
 
 APP = "lanfast"
 PROTO_VERSION = 4
@@ -205,7 +206,7 @@ class Device:
         self.last_seen = time.time()
 
     def label(self):
-        tag = {"android": "手机", "windows": "电脑", "mac": "Mac", "linux": "Linux"}.get(self.os, self.os)
+        tag = {"android": "手机", "windows": "电脑", "mac": "Mac", "linux": "Linux", "web": "网页"}.get(self.os, self.os)
         loc = self.ip if self.ip else "公网中转"
         return f"[{tag}] {self.name} ({loc})"
 
@@ -214,13 +215,15 @@ class Device:
 class LanFastCore:
     def __init__(self, name, save_dir, device_id=None, on_event=None,
                  discovery_port=DISCOVERY_PORT, transfer_port=TRANSFER_PORT,
-                 pin=None, relay_addr="", relay_key=""):
+                 web_port=WEB_PORT, pin=None, relay_addr="", relay_key=""):
         self.id = device_id or uuid.uuid4().hex
         self.name = name
         self.save_dir = save_dir
         self.on_event = on_event or (lambda k, d: None)
         self.discovery_port = discovery_port
         self.transfer_port = transfer_port
+        self.web_port = web_port
+        self.web = WebBridge(self, port=web_port) if web_port else None
         self.pin = pin or generate_pin()
         self.boot_id = secrets.token_hex(4)
 
@@ -258,6 +261,12 @@ class LanFastCore:
 
         for fn in (self._serve_loop, self._udp_loop, self._announce_loop):
             threading.Thread(target=fn, daemon=True).start()
+        if self.web:
+            try:
+                self.web.start()
+            except OSError as e:
+                self._emit("log", f"网页端端口 {self.web_port} 启动失败：{e}")
+                self.web = None
         self._restart_relay()
 
     def stop(self):
@@ -269,6 +278,8 @@ class LanFastCore:
             pass
         self._running = False
         self._relay_gen += 1
+        if self.web:
+            self.web.stop()
         for s in (self._udp, self._srv, self._relay_sock):
             try:
                 if s:
@@ -532,9 +543,19 @@ class LanFastCore:
     def refresh(self):
         threading.Thread(target=self._broadcast, daemon=True).start()
 
+    def register_web_device(self, device_id, name, ip, token):
+        dev = Device(device_id, name, "web", ip, self.web_port or 0, token=token)
+        with self._lock:
+            self.paired[device_id] = dev
+        self._emit("devices", self.device_list())
+        self._emit("paired", dev)
+        self._emit("log", f"🌐 网页设备 {name} ({ip}) 已通过 6 位验证码连接")
+
     def remove_device(self, device_id):
         with self._lock:
-            self.paired.pop(device_id, None)
+            dev = self.paired.pop(device_id, None)
+        if dev and dev.os == "web" and self.web:
+            self.web.kick(device_id)
         self._emit("devices", self.device_list())
 
     # ---------- 端到端加密配对（ECDH P-256 + 零明文 6 位验证码证明）
@@ -855,6 +876,11 @@ class LanFastCore:
     def send_text(self, dev, text):
         def run():
             try:
+                if dev.os == "web" and self.web:
+                    self.web.push_text(dev.id, text)
+                    self._emit("send_done", {"ok": True, "kind": "text", "peer_id": dev.id,
+                                             "to": dev.name, "route": "网页端", "text": text})
+                    return
                 s, route = self._connect(dev)
                 with s:
                     self._send_enc_frame(s, dev, {"type": "text", "token": dev.token, "text": text})
@@ -891,6 +917,13 @@ class LanFastCore:
             total = sum(os.path.getsize(a) for a, _ in items)
             sent, last, t0 = 0, 0.0, time.time()
             try:
+                if dev.os == "web" and self.web:
+                    self.web.push_files(dev.id, items)
+                    self._emit("send_done", {"ok": True, "kind": "file", "peer_id": dev.id, "to": dev.name,
+                                             "route": "网页端（等待浏览器下载）", "count": len(items),
+                                             "total": total, "names": [r for _, r in items],
+                                             "seconds": max(time.time() - t0, 1e-3)})
+                    return
                 s, route = self._connect(dev)
                 with s:
                     for idx, (abspath, rel) in enumerate(items, 1):

@@ -169,7 +169,7 @@ class App:
         self.active_peer_id = None
         self.chats = {}      # peer_id -> list of {time, dir, peer, content, payload}
         self.unread = {}     # peer_id -> int
-        self.row_payload = {}  # treeview iid -> payload
+        self.row_rec = {}    # treeview iid -> rec dict
 
         self.core = LanFastCore(
             self.cfg["name"], self.cfg["save_dir"], self.cfg["id"],
@@ -216,10 +216,13 @@ class App:
         self.pin_label = tk.Label(pin_bar, text=fmt_pin(self.core.pin), bg="#eff6ff", fg="#2563eb",
                                   font=("Consolas", 21, "bold"), padx=6)
         self.pin_label.pack(side="left")
-        tk.Label(pin_bar, text="告诉对方此验证码，或点左侧「添加好友」输入对方的 6 位验证码",
-                 bg="#eff6ff", fg="#475569", font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(8, 0))
+        self.web_label = tk.Label(pin_bar, text="", bg="#eff6ff", fg="#0f766e",
+                                  font=("Microsoft YaHei UI", 9, "bold"), padx=8, cursor="hand2")
+        self.web_label.pack(side="left")
+        self.web_label.bind("<Button-1>", lambda e: self.copy_web_url())
         ttk.Button(pin_bar, text="刷新验证码", command=self.refresh_pin).pack(side="right")
-        ttk.Button(pin_bar, text="复制", command=self.copy_pin).pack(side="right", padx=6)
+        ttk.Button(pin_bar, text="复制码", command=self.copy_pin).pack(side="right", padx=4)
+        ttk.Button(pin_bar, text="复制网页地址", command=self.copy_web_url).pack(side="right")
 
         paned = ttk.PanedWindow(self.root, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=10)
@@ -242,9 +245,12 @@ class App:
 
         # 右侧：当前选中好友的独立对话窗口
         right = ttk.Frame(paned)
-        self.chat_header = tk.Label(right, text="未选择好友对话", anchor="w", bg="#f1f5f9", fg="#0f172a",
+        hdr_bar = tk.Frame(right, bg="#f1f5f9")
+        hdr_bar.pack(fill="x", pady=(0, 4))
+        self.chat_header = tk.Label(hdr_bar, text="未选择好友对话", anchor="w", bg="#f1f5f9", fg="#0f172a",
                                     font=("Microsoft YaHei UI", 10, "bold"), padx=10, pady=6)
-        self.chat_header.pack(fill="x", pady=(0, 4))
+        self.chat_header.pack(side="left", fill="x", expand=True)
+        ttk.Button(hdr_bar, text="清空当前记录", command=self.clear_active_chat).pack(side="right", padx=6, pady=3)
 
         cols = ("time", "dir", "content")
         self.tree = ttk.Treeview(right, columns=cols, show="headings", selectmode="browse")
@@ -259,6 +265,7 @@ class App:
         self.tree.tag_configure("err", foreground="#b91c1c")
         self.tree.bind("<Double-1>", self.on_log_double)
         self.tree.bind("<Button-3>", self.on_log_menu)
+        self.tree.bind("<Delete>", lambda e: self.delete_selected_msg())
 
         box = ttk.Frame(right)
         self.input = tk.Text(box, height=4, font=("Microsoft YaHei UI", 10), wrap="word", undo=True)
@@ -292,8 +299,17 @@ class App:
                 w.drop_target_register(DND_FILES)
                 w.dnd_bind("<<Drop>>", self.on_drop)
 
+    def _web_url(self):
+        return f"http://{best_ip()}:{self.core.web_port}"
+
     def _update_header(self):
         self.header.config(text=f"本机：{self.cfg['name']}    IP：{best_ip()}    接收目录：{self.cfg['save_dir']}")
+        self.web_label.config(text=f"🍎 苹果/浏览器免安装访问：{self._web_url()}")
+
+    def copy_web_url(self):
+        url = self._web_url()
+        self.copy(url)
+        self.set_status(f"已复制网页端地址：{url}（苹果 Safari 直接打开输入 6 位码即可）")
 
     # ------------------------------------------------------------ 事件循环
     def _poll(self):
@@ -418,13 +434,14 @@ class App:
     def _render_active_chat(self):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        self.row_payload.clear()
+        self.row_rec.clear()
         d = self.active_device()
         if d is None:
-            self.chat_header.config(text="未选择好友对话 — 请先点击左侧「添加好友」")
+            self.chat_header.config(text="未选择好友对话 — 请先点击左侧「添加好友」或用浏览器访问网页端")
             return
         loc = d.ip if d.ip else "公网中转"
-        self.chat_header.config(text=f"🔒 端到端加密对话：{d.label()}    ·    AES-256-GCM（{loc}）")
+        mode_tag = "🌐 网页直连" if d.os == "web" else "🔒 AES-256-GCM 端到端加密"
+        self.chat_header.config(text=f"{mode_tag}：{d.label()}    ·    ({loc})")
         for rec in self.chats.get(d.id, []):
             self._insert_tree_row(rec)
 
@@ -432,7 +449,7 @@ class App:
         arrow = {"in": "对方", "out": "我 →", "err": "失败"}[rec["dir"]]
         one_line = rec["content"].replace("\r", "").replace("\n", " ⏎ ")
         iid = self.tree.insert("", "end", values=(rec["time"], arrow, one_line), tags=(rec["dir"],))
-        self.row_payload[iid] = rec["payload"]
+        self.row_rec[iid] = rec
         self.tree.see(iid)
 
     def _append_chat(self, peer_id, direction, content, payload):
@@ -549,10 +566,43 @@ class App:
         self.cfg["auto_copy"] = bool(self.auto_copy.get())
         save_config(self.cfg)
 
-    # ------------------------------------------------------------ 消息右键与双击
+    # ------------------------------------------------------------ 消息右键、删除与双击
+    def clear_active_chat(self):
+        if not self.active_peer_id:
+            return
+        self.chats[self.active_peer_id] = []
+        self._render_active_chat()
+        self.set_status("已清空当前对话记录")
+
+    def delete_msg(self, iid, also_disk=False):
+        rec = self.row_rec.pop(iid, None)
+        if rec is None:
+            return
+        if also_disk and rec["payload"] and rec["payload"][0] == "file":
+            p = rec["payload"][1]
+            if os.path.isfile(p):
+                try:
+                    os.remove(p)
+                except OSError as e:
+                    self.set_status(f"删除本地文件失败：{e}")
+        lst = self.chats.get(self.active_peer_id, [])
+        if rec in lst:
+            lst.remove(rec)
+        try:
+            self.tree.delete(iid)
+        except tk.TclError:
+            pass
+        self.set_status("已删除消息" + ("及本地文件" if also_disk else ""))
+
+    def delete_selected_msg(self):
+        sel = self.tree.selection()
+        if sel:
+            self.delete_msg(sel[0], also_disk=False)
+
     def on_log_double(self, event):
         iid = self.tree.identify_row(event.y)
-        payload = self.row_payload.get(iid)
+        rec = self.row_rec.get(iid)
+        payload = rec["payload"] if rec else None
         if not payload:
             return
         kind, val = payload
@@ -564,17 +614,23 @@ class App:
 
     def on_log_menu(self, event):
         iid = self.tree.identify_row(event.y)
-        payload = self.row_payload.get(iid)
-        if not payload:
+        rec = self.row_rec.get(iid)
+        if not rec:
             return
         self.tree.selection_set(iid)
         m = tk.Menu(self.root, tearoff=0)
-        kind, val = payload
-        if kind == "text":
-            m.add_command(label="复制", command=lambda: self.copy(val))
-        else:
-            m.add_command(label="打开", command=lambda: open_path(val))
-            m.add_command(label="在文件夹中显示", command=lambda: reveal(val))
+        payload = rec["payload"]
+        if payload:
+            kind, val = payload
+            if kind == "text":
+                m.add_command(label="复制文字", command=lambda: self.copy(val))
+            else:
+                m.add_command(label="打开文件", command=lambda: open_path(val))
+                m.add_command(label="在文件夹中显示", command=lambda: reveal(val))
+            m.add_separator()
+        m.add_command(label="删除此条记录", command=lambda: self.delete_msg(iid, False))
+        if payload and payload[0] == "file" and os.path.isfile(payload[1]):
+            m.add_command(label="删除记录并删除本地文件", command=lambda: self.delete_msg(iid, True))
         m.tk_popup(event.x_root, event.y_root)
 
     def copy(self, text):

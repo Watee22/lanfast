@@ -289,6 +289,19 @@ public class MainActivity extends Activity implements Core.Listener {
         titleWrap.addView(chatSub);
         topBar.addView(titleWrap, new LinearLayout.LayoutParams(0, -2, 1));
 
+        Button clr = new Button(this);
+        clr.setText("清空");
+        clr.setTextSize(12);
+        clr.setOnClickListener(v -> {
+            if (activePeerId != null) {
+                core.chatOf(activePeerId).clear();
+                msgAdapter.notifyDataSetChanged();
+                friendAdapter.notifyDataSetChanged();
+                toast("已清空当前对话记录");
+            }
+        });
+        topBar.addView(clr, new LinearLayout.LayoutParams(-2, -2));
+
         Button disc = new Button(this);
         disc.setText("断开");
         disc.setTextSize(12);
@@ -322,7 +335,7 @@ public class MainActivity extends Activity implements Core.Listener {
         msgListView.setAdapter(msgAdapter);
         msgListView.setOnItemClickListener((p, v, pos, id) -> onMsgClick(activeMessages().get(pos)));
         msgListView.setOnItemLongClickListener((p, v, pos, id) -> {
-            onMsgLongClick(activeMessages().get(pos));
+            onMsgLongClick(pos, activeMessages().get(pos));
             return true;
         });
         root.addView(msgListView, new LinearLayout.LayoutParams(-1, 0, 1));
@@ -654,19 +667,43 @@ public class MainActivity extends Activity implements Core.Listener {
         }
     }
 
-    void onMsgLongClick(Core.Msg m) {
-        Intent i = new Intent(Intent.ACTION_SEND);
-        if (m.isFile && m.path != null) {
-            i.setType("*/*");
-            i.putExtra(Intent.EXTRA_STREAM, Uri.fromFile(new File(m.path)));
-        } else {
-            i.setType("text/plain");
-            i.putExtra(Intent.EXTRA_TEXT, m.text);
-        }
-        try {
-            startActivity(Intent.createChooser(i, "分享"));
-        } catch (Exception ignored) {
-        }
+    void onMsgLongClick(final int pos, final Core.Msg m) {
+        final boolean hasLocalFile = m.isFile && m.path != null && new File(m.path).isFile();
+        String[] items = hasLocalFile
+                ? new String[]{"分享", "删除此条消息", "删除消息并删除本地文件"}
+                : new String[]{"分享", "删除此条消息"};
+        new AlertDialog.Builder(this)
+                .setItems(items, (dlg, which) -> {
+                    if (which == 0) {
+                        Intent i = new Intent(Intent.ACTION_SEND);
+                        if (hasLocalFile) {
+                            i.setType("*/*");
+                            i.putExtra(Intent.EXTRA_STREAM, Uri.fromFile(new File(m.path)));
+                        } else {
+                            i.setType("text/plain");
+                            i.putExtra(Intent.EXTRA_TEXT, m.text);
+                        }
+                        try {
+                            startActivity(Intent.createChooser(i, "分享"));
+                        } catch (Exception ignored) {
+                        }
+                    } else if (which == 1 || which == 2) {
+                        if (which == 2 && hasLocalFile) {
+                            //noinspection ResultOfMethodCallIgnored
+                            new File(m.path).delete();
+                        }
+                        ArrayList<Core.Msg> list = activeMessages();
+                        if (pos >= 0 && pos < list.size() && list.get(pos) == m) {
+                            list.remove(pos);
+                        } else {
+                            list.remove(m);
+                        }
+                        msgAdapter.notifyDataSetChanged();
+                        friendAdapter.notifyDataSetChanged();
+                        toast(which == 2 ? "已删除消息及本地文件" : "已删除消息");
+                    }
+                })
+                .show();
     }
 
     void copy(String s) {
