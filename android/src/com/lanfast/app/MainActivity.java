@@ -256,6 +256,18 @@ public class MainActivity extends Activity implements Core.Listener {
         return root;
     }
 
+    Button compactBtn(String label) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setTextSize(12);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        b.setPadding(dp(10), dp(6), dp(10), dp(6));
+        return b;
+    }
+
     View buildChatView() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -265,33 +277,22 @@ public class MainActivity extends Activity implements Core.Listener {
         topBar.setOrientation(LinearLayout.HORIZONTAL);
         topBar.setGravity(Gravity.CENTER_VERTICAL);
         topBar.setBackgroundColor(Color.WHITE);
-        topBar.setPadding(dp(6), dp(6), dp(8), dp(6));
+        topBar.setPadding(dp(8), dp(6), dp(8), dp(6));
 
-        Button back = new Button(this);
-        back.setText("← 好友");
-        back.setTextSize(13);
+        Button back = compactBtn("← 好友");
         back.setOnClickListener(v -> closeChat());
         topBar.addView(back, new LinearLayout.LayoutParams(-2, -2));
 
-        LinearLayout titleWrap = new LinearLayout(this);
-        titleWrap.setOrientation(LinearLayout.VERTICAL);
-        titleWrap.setPadding(dp(8), 0, dp(8), 0);
         chatTitle = new TextView(this);
-        chatTitle.setTextSize(15);
+        chatTitle.setTextSize(16);
         chatTitle.setTypeface(Typeface.DEFAULT_BOLD);
         chatTitle.setTextColor(0xFF111827);
         chatTitle.setSingleLine(true);
-        chatSub = new TextView(this);
-        chatSub.setTextSize(11);
-        chatSub.setTextColor(0xFF6B7280);
-        chatSub.setSingleLine(true);
-        titleWrap.addView(chatTitle);
-        titleWrap.addView(chatSub);
-        topBar.addView(titleWrap, new LinearLayout.LayoutParams(0, -2, 1));
+        chatTitle.setEllipsize(TextUtils.TruncateAt.END);
+        chatTitle.setPadding(dp(10), 0, dp(8), 0);
+        topBar.addView(chatTitle, new LinearLayout.LayoutParams(0, -2, 1));
 
-        Button clr = new Button(this);
-        clr.setText("清空");
-        clr.setTextSize(12);
+        Button clr = compactBtn("清空");
         clr.setOnClickListener(v -> {
             if (activePeerId != null) {
                 core.chatOf(activePeerId).clear();
@@ -300,11 +301,11 @@ public class MainActivity extends Activity implements Core.Listener {
                 toast("已清空当前对话记录");
             }
         });
-        topBar.addView(clr, new LinearLayout.LayoutParams(-2, -2));
+        LinearLayout.LayoutParams clrLp = new LinearLayout.LayoutParams(-2, -2);
+        clrLp.rightMargin = dp(4);
+        topBar.addView(clr, clrLp);
 
-        Button disc = new Button(this);
-        disc.setText("断开");
-        disc.setTextSize(12);
+        Button disc = compactBtn("断开");
         disc.setOnClickListener(v -> {
             if (activePeerId != null) {
                 core.removeFriend(activePeerId);
@@ -313,6 +314,24 @@ public class MainActivity extends Activity implements Core.Listener {
         });
         topBar.addView(disc, new LinearLayout.LayoutParams(-2, -2));
         root.addView(topBar);
+
+        // 独立通栏安全码状态条，完整展示 4 位 Emoji 安全码与连接地址（点按可放大核对）
+        chatSub = new TextView(this);
+        chatSub.setTextSize(13);
+        chatSub.setTextColor(0xFF065F46);
+        chatSub.setBackgroundColor(0xFFECFDF5);
+        chatSub.setPadding(dp(12), dp(6), dp(12), dp(6));
+        chatSub.setOnClickListener(v -> {
+            Core.Device d = core.friend(activePeerId);
+            if (d != null && d.sas != null && !d.sas.isEmpty()) {
+                new AlertDialog.Builder(this)
+                        .setTitle("端到端加密安全码")
+                        .setMessage("请确认对方「" + d.name + "」聊天顶栏显示的 4 个图标与此完全一致：\n\n        " + d.sas + "\n\n一致即证明无任何中间人攻击。")
+                        .setPositiveButton("知道了", null)
+                        .show();
+            }
+        });
+        root.addView(chatSub, new LinearLayout.LayoutParams(-1, -2));
 
         chatPending = new TextView(this);
         chatPending.setBackgroundColor(0xFFFFF4E5);
