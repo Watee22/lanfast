@@ -11,6 +11,7 @@ import uuid
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .core import LanFastCore, best_ip, human_size, local_ipv4s
+from .qr import encode_qr
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -35,6 +36,7 @@ def load_config():
     cfg.setdefault("auto_copy", True)
     cfg.setdefault("relay_addr", "")
     cfg.setdefault("relay_key", "")
+    cfg.setdefault("p2p_url", "")
     save_config(cfg)
     return cfg
 
@@ -149,6 +151,138 @@ class RelayDialog(tk.Toplevel):
         self.destroy()
 
 
+class QrDialog(tk.Toplevel):
+    """双标签二维码弹窗：局域网直连码 + 独立 P2P 信令服务码（提前保存 P2P 地址）。"""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.title("扫码连接（iPhone / 安卓 / 浏览器）")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.app = app
+
+        nb = ttk.Notebook(self, padding=10)
+        nb.pack(fill="both", expand=True)
+
+        # ---- Tab 1: 局域网直连码（内置 53533 网页端）
+        t1 = ttk.Frame(nb, padding=12)
+        nb.add(t1, text="  局域网直连码  ")
+
+        ttk.Label(t1, text="苹果/安卓相机扫一扫即可免安装直连本机", font=("Microsoft YaHei UI", 10, "bold")).pack()
+        self.lan_canvas = tk.Canvas(t1, width=256, height=256, bg="#ffffff", highlightthickness=1, highlightbackground="#e2e8f0")
+        self.lan_canvas.pack(pady=10)
+        self.lan_url_lbl = ttk.Label(t1, foreground="#0f766e", font=("Consolas", 9))
+        self.lan_url_lbl.pack()
+
+        opt_row = ttk.Frame(t1)
+        opt_row.pack(fill="x", pady=(8, 4))
+        self.with_pin = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row, text="包含验证码（扫码免输，仍走 SPAKE2 零明文）",
+                        variable=self.with_pin, command=self._render_lan).pack(side="left")
+
+        ips = local_ipv4s() or [best_ip()]
+        self.ip_var = tk.StringVar(value=best_ip() if best_ip() in ips else ips[0])
+        if len(ips) > 1:
+            ip_row = ttk.Frame(t1)
+            ip_row.pack(fill="x", pady=(2, 4))
+            ttk.Label(ip_row, text="网卡 IP：").pack(side="left")
+            cb = ttk.Combobox(ip_row, textvariable=self.ip_var, values=ips, state="readonly", width=18)
+            cb.pack(side="left")
+            cb.bind("<<ComboboxSelected>>", lambda e: self._render_lan())
+
+        btn_row1 = ttk.Frame(t1)
+        btn_row1.pack(fill="x", pady=(6, 0))
+        ttk.Button(btn_row1, text="复制链接", command=self._copy_lan).pack(side="left")
+        ttk.Button(btn_row1, text="刷新 6 位码", command=self._refresh_pin_and_qr).pack(side="right")
+
+        # ---- Tab 2: 独立 P2P 信令服务码（提前保存 P2P 信令服务器地址）
+        t2 = ttk.Frame(nb, padding=12)
+        nb.add(t2, text="  P2P 信令服务码  ")
+
+        ttk.Label(t2, text="独立 P2P 网页信令服务二维码（两台手机扫码即可 WebRTC P2P 互联）",
+                  font=("Microsoft YaHei UI", 9, "bold"), wraplength=300, justify="center").pack()
+        self.p2p_canvas = tk.Canvas(t2, width=256, height=256, bg="#ffffff", highlightthickness=1, highlightbackground="#e2e8f0")
+        self.p2p_canvas.pack(pady=10)
+        self.p2p_status = ttk.Label(t2, foreground="#475569", wraplength=300, justify="center")
+        self.p2p_status.pack()
+
+        edit_row = ttk.Frame(t2)
+        edit_row.pack(fill="x", pady=(10, 4))
+        ttk.Label(edit_row, text="P2P 服务地址：").pack(anchor="w")
+        in_row = ttk.Frame(t2)
+        in_row.pack(fill="x")
+        self.p2p_var = tk.StringVar(value=app.cfg.get("p2p_url", ""))
+        ttk.Entry(in_row, textvariable=self.p2p_var, width=28).pack(side="left", fill="x", expand=True)
+        ttk.Button(in_row, text="保存并生成", command=self._save_p2p).pack(side="right", padx=(6, 0))
+        ttk.Label(t2, text="示例：https://p2p.你的域名 或 http://服务器IP:53534", foreground="#64748b",
+                  font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(4, 0))
+
+        self._render_lan()
+        self._render_p2p()
+
+    @staticmethod
+    def _draw_qr(canvas: tk.Canvas, text: str):
+        canvas.delete("all")
+        try:
+            mat = encode_qr(text)
+        except Exception as e:
+            canvas.create_text(128, 128, text=str(e), fill="#b91c1c", width=220)
+            return
+        n = len(mat)
+        quiet = 4
+        total = n + quiet * 2
+        size = 256
+        scale = size / total
+        canvas.create_rectangle(0, 0, size, size, fill="#ffffff", outline="")
+        for r in range(n):
+            row = mat[r]
+            for c in range(n):
+                if row[c]:
+                    x0 = (c + quiet) * scale
+                    y0 = (r + quiet) * scale
+                    canvas.create_rectangle(x0, y0, x0 + scale + 0.4, y0 + scale + 0.4, fill="#000000", outline="")
+
+    def _lan_url(self):
+        base = f"http://{self.ip_var.get()}:{self.app.core.web_port}"
+        return f"{base}#pin={self.app.core.pin}" if self.with_pin.get() else base
+
+    def _render_lan(self):
+        url = self._lan_url()
+        self._draw_qr(self.lan_canvas, url)
+        self.lan_url_lbl.config(text=f"http://{self.ip_var.get()}:{self.app.core.web_port}"
+                                + ("  （已内嵌 #pin 扫码直连）" if self.with_pin.get() else ""))
+
+    def _copy_lan(self):
+        u = self._lan_url()
+        self.app.copy(u)
+        self.app.set_status("已复制局域网扫码链接")
+
+    def _refresh_pin_and_qr(self):
+        self.app.refresh_pin()
+        self._render_lan()
+
+    def _save_p2p(self):
+        u = self.p2p_var.get().strip()
+        if u and not u.startswith(("http://", "https://")):
+            u = "https://" + u
+            self.p2p_var.set(u)
+        self.app.cfg["p2p_url"] = u
+        save_config(self.app.cfg)
+        self._render_p2p()
+        self.app.set_status("已保存 P2P 信令服务器地址" if u else "已清除 P2P 地址")
+
+    def _render_p2p(self):
+        u = self.app.cfg.get("p2p_url", "").strip()
+        if not u:
+            self.p2p_canvas.delete("all")
+            self.p2p_canvas.create_text(128, 128, text="请先在下方填写并保存\nP2P 信令服务器地址\n\n（填一次永久记住）",
+                                        fill="#64748b", justify="center", font=("Microsoft YaHei UI", 10))
+            self.p2p_status.config(text="未配置 P2P 信令服务地址")
+            return
+        self._draw_qr(self.p2p_canvas, u)
+        self.p2p_status.config(text=f"扫码直接打开：{u}")
+
+
 class App:
     def __init__(self):
         self.cfg = load_config()
@@ -222,7 +356,7 @@ class App:
         self.web_label.bind("<Button-1>", lambda e: self.copy_web_url())
         ttk.Button(pin_bar, text="刷新验证码", command=self.refresh_pin).pack(side="right")
         ttk.Button(pin_bar, text="复制码", command=self.copy_pin).pack(side="right", padx=4)
-        ttk.Button(pin_bar, text="复制网页地址", command=self.copy_web_url).pack(side="right")
+        ttk.Button(pin_bar, text="📱 扫码二维码", command=self.open_qr_dialog).pack(side="right", padx=(0, 4))
 
         paned = ttk.PanedWindow(self.root, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=10)
@@ -479,6 +613,9 @@ class App:
         return d
 
     # ------------------------------------------------------------ 动作
+    def open_qr_dialog(self):
+        QrDialog(self.root, self)
+
     def open_add_friend(self):
         AddFriendDialog(self.root, lambda pin, ip: (
             self.set_status("正在验证 6 位验证码并建立连接…"),

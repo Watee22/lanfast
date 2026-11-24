@@ -424,6 +424,13 @@ async function initInfo() {
     } catch (e) {}
     sessionStorage.removeItem("lf_session");
   }
+  // 支持扫码一键直连：#pin=123456（URL Fragment 不经网络发送，读完立即从地址栏抹除再走 SPAKE2 握手）
+  const hm = (location.hash || "").match(/pin=(\d{6})/);
+  if (hm) {
+    try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+    $("pinInput").value = hm[1];
+    doLogin();
+  }
 }
 
 async function doLogin() {

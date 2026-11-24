@@ -28,8 +28,10 @@ import android.view.ViewGroup;
 import android.webkit.MimeTypeMap;
 import android.widget.BaseAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.ProgressBar;
@@ -198,6 +200,22 @@ public class MainActivity extends Activity implements Core.Listener {
         LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(-1, -2);
         wlp.topMargin = dp(8);
         pinCard.addView(webBar, wlp);
+
+        LinearLayout qrRow = new LinearLayout(this);
+        qrRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams qrRowLp = new LinearLayout.LayoutParams(-1, -2);
+        qrRowLp.topMargin = dp(8);
+
+        Button lanQrBtn = compactBtn("📱 局域网/热点二维码");
+        lanQrBtn.setOnClickListener(v -> openLanQrDialog());
+        LinearLayout.LayoutParams q1Lp = new LinearLayout.LayoutParams(0, -2, 1);
+        q1Lp.rightMargin = dp(6);
+        qrRow.addView(lanQrBtn, q1Lp);
+
+        Button p2pQrBtn = compactBtn("🌐 P2P 信令服务码");
+        p2pQrBtn.setOnClickListener(v -> openP2pQrDialog());
+        qrRow.addView(p2pQrBtn, new LinearLayout.LayoutParams(0, -2, 1));
+        pinCard.addView(qrRow, qrRowLp);
 
         relayBar = new TextView(this);
         relayBar.setTextSize(12);
@@ -493,6 +511,138 @@ public class MainActivity extends Activity implements Core.Listener {
     }
 
     // ------------------------------------------------------------------ 弹窗：加好友 / 配中转
+    void openLanQrDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        box.setPadding(dp(20), dp(14), dp(20), dp(8));
+
+        TextView tip = new TextView(this);
+        tip.setText("苹果 / 其他手机连同一 WiFi（或本机热点）后，相机扫一扫即可免安装直连");
+        tip.setTextSize(12);
+        tip.setTextColor(0xFF4B5563);
+        tip.setGravity(Gravity.CENTER);
+        box.addView(tip);
+
+        final ImageView iv = new ImageView(this);
+        iv.setAdjustViewBounds(true);
+        LinearLayout.LayoutParams ivLp = new LinearLayout.LayoutParams(dp(230), dp(230));
+        ivLp.topMargin = dp(10);
+        ivLp.bottomMargin = dp(8);
+        box.addView(iv, ivLp);
+
+        final TextView urlText = new TextView(this);
+        urlText.setTextSize(12);
+        urlText.setTextColor(0xFF0F766E);
+        urlText.setGravity(Gravity.CENTER);
+        box.addView(urlText);
+
+        final CheckBox cb = new CheckBox(this);
+        cb.setText("包含 6 位码（扫码免输，仍走 SPAKE2 零明文）");
+        cb.setTextSize(12);
+        cb.setChecked(true);
+        box.addView(cb);
+
+        final String base = "http://" + Core.localIp() + ":" + WebBridge.WEB_PORT;
+        Runnable render = () -> {
+            String u = cb.isChecked() ? (base + "#pin=" + core.pin) : base;
+            try {
+                iv.setImageBitmap(QrCode.toBitmap(u, dp(230)));
+                urlText.setText(base + (cb.isChecked() ? "\n（已内嵌 #pin 扫码自动直连）" : ""));
+            } catch (Exception e) {
+                urlText.setText("生成二维码失败：" + e.getMessage());
+            }
+        };
+        cb.setOnCheckedChangeListener((b, c) -> render.run());
+        render.run();
+
+        new AlertDialog.Builder(this)
+                .setTitle("局域网 / 热点直连二维码")
+                .setView(box)
+                .setPositiveButton("复制链接", (d, w) -> {
+                    copy(cb.isChecked() ? (base + "#pin=" + core.pin) : base);
+                    toast("已复制链接");
+                })
+                .setNegativeButton("关闭", null)
+                .show();
+    }
+
+    void openP2pQrDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        box.setPadding(dp(20), dp(14), dp(20), dp(8));
+
+        TextView tip = new TextView(this);
+        tip.setText("专属 P2P 信令网页服务二维码（提前保存你的 web_p2p.py 地址，填一次永久记住）");
+        tip.setTextSize(12);
+        tip.setTextColor(0xFF4B5563);
+        tip.setGravity(Gravity.CENTER);
+        box.addView(tip);
+
+        final ImageView iv = new ImageView(this);
+        iv.setAdjustViewBounds(true);
+        LinearLayout.LayoutParams ivLp = new LinearLayout.LayoutParams(dp(220), dp(220));
+        ivLp.topMargin = dp(10);
+        ivLp.bottomMargin = dp(6);
+        box.addView(iv, ivLp);
+
+        final TextView status = new TextView(this);
+        status.setTextSize(12);
+        status.setTextColor(0xFF0F766E);
+        status.setGravity(Gravity.CENTER);
+        box.addView(status);
+
+        final EditText eUrl = new EditText(this);
+        eUrl.setHint("例如 https://p2p.你的域名 或 http://IP:53534");
+        eUrl.setSingleLine(true);
+        eUrl.setTextSize(13);
+        eUrl.setText(core.p2pUrl);
+        LinearLayout.LayoutParams eLp = new LinearLayout.LayoutParams(-1, -2);
+        eLp.topMargin = dp(10);
+        box.addView(eUrl, eLp);
+
+        Button saveBtn = compactBtn("保存并生成 P2P 二维码");
+        LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(-1, -2);
+        sLp.topMargin = dp(6);
+        box.addView(saveBtn, sLp);
+
+        Runnable render = () -> {
+            String u = core.p2pUrl;
+            if (u == null || u.isEmpty()) {
+                iv.setVisibility(View.GONE);
+                status.setText("尚未配置 P2P 信令服务器地址，请在下方填写并保存");
+            } else {
+                try {
+                    iv.setVisibility(View.VISIBLE);
+                    iv.setImageBitmap(QrCode.toBitmap(u, dp(220)));
+                    status.setText("苹果 / 安卓相机扫一扫即可打开：\n" + u);
+                } catch (Exception e) {
+                    status.setText("生成失败：" + e.getMessage());
+                }
+            }
+        };
+        saveBtn.setOnClickListener(v -> {
+            core.setP2pUrl(eUrl.getText().toString());
+            eUrl.setText(core.p2pUrl);
+            render.run();
+            toast(core.p2pUrl.isEmpty() ? "已清除 P2P 地址" : "已保存 P2P 信令服务地址");
+        });
+        render.run();
+
+        new AlertDialog.Builder(this)
+                .setTitle("P2P 信令服务独立二维码")
+                .setView(box)
+                .setPositiveButton("复制地址", (d, w) -> {
+                    if (core.p2pUrl != null && !core.p2pUrl.isEmpty()) {
+                        copy(core.p2pUrl);
+                        toast("已复制 P2P 地址");
+                    }
+                })
+                .setNegativeButton("关闭", null)
+                .show();
+    }
+
     void openAddFriendDialog() {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -647,6 +797,21 @@ public class MainActivity extends Activity implements Core.Listener {
     void handleIntent(Intent intent) {
         if (intent == null) return;
         String a = intent.getAction();
+        if (Intent.ACTION_VIEW.equals(a) && intent.getData() != null) {
+            Uri data = intent.getData();
+            if ("lanfast".equals(data.getScheme()) && "pair".equals(data.getHost())) {
+                String pin = data.getQueryParameter("pin");
+                String ip = data.getQueryParameter("ip");
+                if (pin != null && pin.matches("\\d{6}")) {
+                    toast("扫码自动 SPAKE2 验证中…");
+                    core.pairByPin(pin, ip == null ? "" : ip, (ok, dev, msg) -> {
+                        toast(msg);
+                        if (ok && dev != null) openChat(dev.id);
+                    });
+                }
+            }
+            return;
+        }
         if (Intent.ACTION_SEND.equals(a)) {
             Uri u = intent.getParcelableExtra(Intent.EXTRA_STREAM);
             if (u != null) pending.add(u);

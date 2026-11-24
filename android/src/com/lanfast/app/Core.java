@@ -151,6 +151,7 @@ public class Core {
     public volatile String name;
     public volatile String relayAddr;
     public volatile String relayKey;
+    public volatile String p2pUrl;
     public volatile boolean relayConnected;
     public volatile String relayStatusText = "仅局域网（点击配置公网中转）";
     public volatile Listener listener;
@@ -195,7 +196,17 @@ public class Core {
         name = prefs.getString("name", Build.MODEL);
         relayAddr = prefs.getString("relay_addr", "");
         relayKey = prefs.getString("relay_key", "");
+        p2pUrl = prefs.getString("p2p_url", "");
         webBridge = new WebBridge(this, WebBridge.WEB_PORT);
+    }
+
+    public void setP2pUrl(String url) {
+        String u = url == null ? "" : url.trim();
+        if (!u.isEmpty() && !u.startsWith("http://") && !u.startsWith("https://")) {
+            u = "https://" + u;
+        }
+        p2pUrl = u;
+        prefs.edit().putString("p2p_url", p2pUrl).apply();
     }
 
     private String generatePin() {

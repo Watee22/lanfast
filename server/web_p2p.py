@@ -137,6 +137,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: #fff; padding: 8px 16px; border-radius: 999px; font-size: 13px; z-index: 999; pointer-events: none; max-width: 90vw; text-align: center; }
   .warn-banner { margin: 8px 12px 0; padding: 8px 12px; border-radius: 10px; background: #fffbeb;
     border: 1px solid #fde68a; color: #92400e; font-size: 12px; line-height: 1.5; }
+  .modal-bg { position: fixed; inset: 0; background: rgba(15,23,42,.55); display: flex;
+    align-items: center; justify-content: center; padding: 20px; z-index: 900; }
+  .modal-card { background: #fff; border-radius: 18px; padding: 22px 20px; width: 100%; max-width: 340px;
+    text-align: center; box-shadow: 0 20px 50px rgba(0,0,0,.22); }
+  .modal-card canvas { width: 220px; height: 220px; image-rendering: pixelated; border-radius: 8px;
+    border: 1px solid var(--border); margin: 12px 0; }
 </style>
 </head>
 <body>
@@ -154,6 +160,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <div id="myPin" class="pin-val">--- ---</div>
         </div>
         <div class="pin-ops">
+          <button id="qrBtn" class="btn-lite">扫码直连</button>
           <button id="copyPinBtn" class="btn-lite">复制</button>
           <button id="refreshPinBtn" class="btn-lite">刷新</button>
         </div>
@@ -200,6 +207,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+</div>
+
+<div id="qrModal" class="modal-bg hidden">
+  <div class="modal-card">
+    <div style="font-size:16px;font-weight:700">扫码 WebRTC P2P 直连</div>
+    <div style="font-size:12px;color:#6b7280;margin-top:4px">另一台 iPhone / 安卓相机扫一扫即可自动建立内网 P2P 加密直连</div>
+    <canvas id="qrCanvas" width="240" height="240"></canvas>
+    <div id="qrHint" style="font-size:12px;color:#0f766e;word-break:break-all;margin-bottom:12px"></div>
+    <button id="qrCloseBtn" class="add-btn" style="width:100%;padding:10px">关闭</button>
+  </div>
 </div>
 
 <script>
@@ -286,6 +303,122 @@ async function boot() {
   $("lanCount").textContent = "同内网在线：" + reg.lanOnline + " 台";
   renderFriends();
   openEventStream();
+  // 支持扫码一键触发 WebRTC P2P 直连：#pair=123456
+  const pm = (location.hash || "").match(/pair=(\d{6})/);
+  if (pm) {
+    try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+    $("peerPinInput").value = pm[1];
+    setTimeout(() => $("connectBtn").click(), 250);
+  }
+}
+
+// ---- 零依赖标准 QR Code 编码器（ISO/IEC 18004, Byte 模式, EC Level M, V1~10）
+const _QR_SPEC = [null,[10,1,16,0,0],[16,1,28,0,0],[26,1,44,0,0],[18,2,32,0,0],[24,2,43,0,0],[16,4,27,0,0],[18,4,31,0,0],[22,2,38,2,39],[22,3,36,2,37],[26,4,43,1,44]];
+const _QR_AL = [null,[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],[6,26,46],[6,28,50]];
+const _QEXP = new Uint8Array(512), _QLOG = new Uint8Array(256);
+{ let v = 1; for (let i = 0; i < 255; i++) { _QEXP[i] = v; _QLOG[v] = i; v <<= 1; if (v & 0x100) v ^= 0x11d; } for (let i = 255; i < 512; i++) _QEXP[i] = _QEXP[i - 255]; }
+const _qmul = (a, b) => (a && b) ? _QEXP[_QLOG[a] + _QLOG[b]] : 0;
+function _qrs(data, deg) {
+  let g = [1];
+  for (let i = 0; i < deg; i++) {
+    const n = new Array(g.length + 1).fill(0), rt = _QEXP[i];
+    for (let j = 0; j < g.length; j++) { n[j] ^= g[j]; n[j + 1] ^= _qmul(g[j], rt); }
+    g = n;
+  }
+  const r = new Array(deg).fill(0);
+  for (const b of data) {
+    const f = b ^ r.shift(); r.push(0);
+    if (f) for (let i = 0; i < deg; i++) r[i] ^= _qmul(g[i + 1], f);
+  }
+  return r;
+}
+function encodeQrJs(text) {
+  const pay = new TextEncoder().encode(text);
+  let ver = 0;
+  for (let v = 1; v <= 10; v++) {
+    const s = _QR_SPEC[v];
+    if (pay.length + (v <= 9 ? 2 : 3) <= s[1]*s[2] + s[3]*s[4]) { ver = v; break; }
+  }
+  if (!ver) throw new Error("URL 过长");
+  const [ecLen, g1, d1, g2, d2] = _QR_SPEC[ver], cap = g1*d1 + g2*d2;
+  const bits = [];
+  const push = (val, len) => { for (let i = len - 1; i >= 0; i--) bits.push((val >> i) & 1); };
+  push(4, 4); push(pay.length, ver <= 9 ? 8 : 16);
+  for (const b of pay) push(b, 8);
+  push(0, Math.min(4, cap*8 - bits.length));
+  while (bits.length & 7) bits.push(0);
+  const db = [];
+  for (let i = 0; i < bits.length; i += 8) { let v = 0; for (let j = 0; j < 8; j++) v = (v << 1) | bits[i + j]; db.push(v); }
+  for (let p = 0; db.length < cap; p ^= 1) db.push(p ? 0x11 : 0xec);
+  const blks = [], ecs = []; let off = 0;
+  for (const [cnt, dl] of [[g1, d1], [g2, d2]]) for (let i = 0; i < cnt; i++) {
+    const b = db.slice(off, off + dl); off += dl; blks.push(b); ecs.push(_qrs(b, ecLen));
+  }
+  const cw = [], maxD = Math.max(d1, d2);
+  for (let i = 0; i < maxD; i++) for (const b of blks) if (i < b.length) cw.push(b[i]);
+  for (let i = 0; i < ecLen; i++) for (const e of ecs) cw.push(e[i]);
+  const sz = ver*4 + 17;
+  const grid = Array.from({length: sz}, () => new Uint8Array(sz));
+  const fn = Array.from({length: sz}, () => new Uint8Array(sz));
+  const setF = (r, c, v) => { if (r >= 0 && r < sz && c >= 0 && c < sz) { grid[r][c] = v ? 1 : 0; fn[r][c] = 1; } };
+  const finder = (r0, c0) => { for (let dr = -1; dr <= 7; dr++) for (let dc = -1; dc <= 7; dc++) {
+    const d = dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6 && (dr===0||dr===6||dc===0||dc===6||(dr>=2&&dr<=4&&dc>=2&&dc<=4));
+    setF(r0 + dr, c0 + dc, d);
+  }};
+  finder(0, 0); finder(0, sz - 7); finder(sz - 7, 0);
+  for (let i = 8; i < sz - 8; i++) { setF(6, i, (i & 1) === 0); setF(i, 6, (i & 1) === 0); }
+  for (const r0 of _QR_AL[ver]) for (const c0 of _QR_AL[ver]) {
+    if ((r0===6&&c0===6)||(r0===6&&c0===sz-7)||(r0===sz-7&&c0===6)) continue;
+    for (let dr = -2; dr <= 2; dr++) for (let dc = -2; dc <= 2; dc++) setF(r0+dr, c0+dc, Math.max(Math.abs(dr), Math.abs(dc)) !== 1);
+  }
+  setF(sz - 8, 8, 1);
+  for (let i = 0; i < 9; i++) if (i !== 6) { setF(8, i, 0); setF(i, 8, 0); }
+  for (let i = 0; i < 8; i++) { setF(8, sz - 1 - i, 0); setF(sz - 1 - i, 8, 0); }
+  if (ver >= 7) {
+    let rem = ver; for (let i = 0; i < 12; i++) rem = (rem << 1) ^ (((rem >> 11) & 1) * 0x1f25);
+    const vb = (ver << 12) | rem;
+    for (let i = 0; i < 18; i++) { const b = (vb >> i) & 1, a = sz - 11 + (i % 3), c = (i / 3) | 0; setF(a, c, b); setF(c, a, b); }
+  }
+  let bp = 0, up = true, col = sz - 1;
+  while (col > 0) {
+    if (col === 6) col--;
+    for (let st = 0; st < sz; st++) {
+      const r = up ? sz - 1 - st : st;
+      for (let dc = 0; dc >= -1; dc--) {
+        const cc = col + dc;
+        if (!fn[r][cc]) { grid[r][cc] = bp < cw.length*8 ? ((cw[bp >> 3] >> (7 - (bp & 7))) & 1) : 0; bp++; }
+      }
+    }
+    col -= 2; up = !up;
+  }
+  const mfn = [(r,c)=>(r+c)%2===0,(r,c)=>r%2===0,(r,c)=>c%3===0,(r,c)=>(r+c)%3===0,(r,c)=>(((r>>1)+((c/3)|0))&1)===0,(r,c)=>((r*c)%2+(r*c)%3)===0,(r,c)=>(((r*c)%2+(r*c)%3)%2)===0,(r,c)=>(((r+c)%2+(r*c)%3)%2)===0];
+  let best = null, bestSc = 1e9;
+  for (let m = 0; m < 8; m++) {
+    const g = grid.map((row, r) => row.map((v, c) => (!fn[r][c] && mfn[m](r, c)) ? (v ^ 1) : v));
+    let rem = m; for (let i = 0; i < 10; i++) rem = (rem << 1) ^ (((rem >> 9) & 1) * 0x537);
+    const fb = ((m << 10) | rem) ^ 0x5412;
+    for (let i = 0; i < 6; i++) g[8][i] = (fb >> (14 - i)) & 1;
+    g[8][7] = (fb >> 8) & 1; g[8][8] = (fb >> 7) & 1; g[7][8] = (fb >> 6) & 1;
+    for (let i = 0; i < 6; i++) g[5 - i][8] = (fb >> (5 - i)) & 1;
+    for (let i = 0; i < 8; i++) g[8][sz - 1 - i] = (fb >> i) & 1;
+    for (let i = 0; i < 7; i++) g[sz - 1 - i][8] = (fb >> (14 - i)) & 1;
+    let sc = 0, dark = 0;
+    for (let r = 0; r < sz; r++) { let run = 1; dark += g[r][0]; for (let c = 1; c < sz; c++) { dark += g[r][c]; if (g[r][c]===g[r][c-1]) { run++; if (run===5) sc+=3; else if (run>5) sc++; } else run=1; } }
+    for (let c = 0; c < sz; c++) { let run = 1; for (let r = 1; r < sz; r++) { if (g[r][c]===g[r-1][c]) { run++; if (run===5) sc+=3; else if (run>5) sc++; } else run=1; } }
+    for (let r = 0; r < sz - 1; r++) for (let c = 0; c < sz - 1; c++) if (g[r][c]===g[r][c+1]&&g[r][c]===g[r+1][c]&&g[r][c]===g[r+1][c+1]) sc += 3;
+    sc += Math.abs(((dark * 20) / (sz * sz) | 0) - 10) * 10;
+    if (sc < bestSc) { bestSc = sc; best = g; }
+  }
+  return best;
+}
+function drawQrCanvas(canvas, text) {
+  const m = encodeQrJs(text), n = m.length, q = 4, tot = n + q * 2;
+  const cell = Math.max(4, Math.floor(240 / tot)), sz = tot * cell;
+  canvas.width = sz; canvas.height = sz;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, sz, sz);
+  ctx.fillStyle = "#000";
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (m[r][c]) ctx.fillRect((c + q) * cell, (r + q) * cell, cell, cell);
 }
 
 function openEventStream() {
@@ -636,6 +769,14 @@ function appendMsgDom(p, rec) {
 }
 
 // ---------------------------------------------------------------- 事件绑定
+$("qrBtn").onclick = () => {
+  const url = location.origin + location.pathname + "#pair=" + me.pin;
+  drawQrCanvas($("qrCanvas"), url);
+  $("qrHint").textContent = location.origin + location.pathname + "  （已内嵌本机 6 位码）";
+  $("qrModal").classList.remove("hidden");
+};
+$("qrCloseBtn").onclick = () => $("qrModal").classList.add("hidden");
+$("qrModal").onclick = e => { if (e.target === $("qrModal")) $("qrModal").classList.add("hidden"); };
 $("myPin").onclick = $("copyPinBtn").onclick = () => copyText(me.pin);
 $("refreshPinBtn").onclick = async () => {
   const r = await api("/api/refresh_pin");

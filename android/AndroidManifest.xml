@@ -40,6 +40,13 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="*/*" />
             </intent-filter>
+            <!-- 支持外部扫码器通过 lanfast://pair?pin=123456&ip=... 直接拉起配对 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="lanfast" android:host="pair" />
+            </intent-filter>
         </activity>
 
         <service
