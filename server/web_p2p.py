@@ -261,6 +261,11 @@ function toast(s) {
 }
 async function copyText(s) {
   try {
+    if (window.AndroidApp && window.AndroidApp.copyText) {
+      window.AndroidApp.copyText(String(s));
+      toast("已复制");
+      return;
+    }
     if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(s);
     else {
       const ta = document.createElement("textarea"); ta.value = s;
@@ -270,6 +275,29 @@ async function copyText(s) {
     }
     toast("已复制");
   } catch (e) { toast("请长按手动复制"); }
+}
+
+async function saveBlobInAndroid(blob, fileName) {
+  const CH = 192 * 1024; // 192 KiB -> ~256 KiB Base64，安全避开 Android Binder 单次限制
+  const id = window.AndroidApp.beginSave(fileName || "file");
+  if (!id) { toast("无法创建保存文件"); return; }
+  try {
+    let off = 0;
+    while (off < blob.size) {
+      const buf = new Uint8Array(await blob.slice(off, off + CH).arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < buf.length; i += 8192) {
+        bin += String.fromCharCode.apply(null, buf.subarray(i, i + 8192));
+      }
+      if (!window.AndroidApp.appendSave(id, btoa(bin))) throw new Error("写入失败");
+      off += buf.length;
+    }
+    const saved = window.AndroidApp.finishSave(id);
+    toast(saved ? ("已保存：" + saved) : "保存失败");
+  } catch (e) {
+    window.AndroidApp.abortSave(id);
+    toast("保存失败：" + e.message);
+  }
 }
 function setStatus(s, pct = -1) {
   $("statusText").textContent = s;
@@ -570,7 +598,7 @@ function onDataMessage(p, data) {
       const blob = new Blob(r.chunks, { type: r.mime });
       const url = URL.createObjectURL(blob);
       const isImg = /^image\//i.test(r.mime) || /\.(png|jpe?g|gif|webp|bmp)$/i.test(r.name);
-      pushMsg(p, { id: Math.random().toString(36).slice(2), dir: "in", kind: "file", fileName: r.name, size: r.size, url, isImg, time: nowStr() });
+      pushMsg(p, { id: Math.random().toString(36).slice(2), dir: "in", kind: "file", fileName: r.name, size: r.size, url, blob, isImg, time: nowStr() });
       if (activeConnId === p.connId) {
         setStatus(`已接收 ${r.name}（${human(r.size)}）`, 100);
         setTimeout(() => setStatus("就绪", -1), 1500);
@@ -713,6 +741,7 @@ function closeChat() {
 
 function deleteMsg(p, rec, rowEl) {
   if (rec.url) URL.revokeObjectURL(rec.url);
+  rec.blob = null;
   const idx = p.msgs.indexOf(rec);
   if (idx >= 0) p.msgs.splice(idx, 1);
   rowEl.remove();
@@ -742,6 +771,9 @@ function appendMsgDom(p, rec) {
     if (rec.url) {
       const a = document.createElement("a"); a.className = "dl-btn"; a.href = rec.url; a.download = rec.fileName;
       a.textContent = "保存文件";
+      if (window.AndroidApp && window.AndroidApp.beginSave && rec.blob) {
+        a.onclick = ev => { ev.preventDefault(); saveBlobInAndroid(rec.blob, rec.fileName); };
+      }
       fc.appendChild(a);
     }
     const ops = document.createElement("div"); ops.className = "ops";

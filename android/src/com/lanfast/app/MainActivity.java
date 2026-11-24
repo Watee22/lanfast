@@ -12,6 +12,7 @@ import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -19,13 +20,20 @@ import android.os.StrictMode;
 import android.text.InputFilter;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.util.Base64;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.JavascriptInterface;
 import android.webkit.MimeTypeMap;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
@@ -39,9 +47,11 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 
@@ -52,10 +62,15 @@ import java.util.Locale;
  */
 public class MainActivity extends Activity implements Core.Listener {
     static final int REQ_PICK = 1;
+    static final int REQ_WEB_FILE = 3;
     static final int BLUE = 0xFF2563EB;
 
     Core core;
-    View homeView, chatView;
+    View homeView, chatView, p2pView;
+    WebView p2pWebView;
+    TextView p2pUrlTitle;
+    boolean inP2pMode;
+    ValueCallback<Uri[]> webFileCallback;
 
     // 首页控件
     TextView myPinText, webBar, relayBar, homePending, homeEmpty, homeFooter;
@@ -109,7 +124,13 @@ public class MainActivity extends Activity implements Core.Listener {
 
     @Override
     public void onBackPressed() {
-        if (activePeerId != null) {
+        if (inP2pMode) {
+            if (p2pWebView != null && p2pWebView.canGoBack()) {
+                p2pWebView.goBack();
+            } else {
+                closeP2pMode();
+            }
+        } else if (activePeerId != null) {
             closeChat();
         } else {
             super.onBackPressed();
@@ -133,8 +154,10 @@ public class MainActivity extends Activity implements Core.Listener {
         FrameLayout frame = new FrameLayout(this);
         homeView = buildHomeView();
         chatView = buildChatView();
+        p2pView = buildP2pView();
         frame.addView(homeView, new FrameLayout.LayoutParams(-1, -1));
         frame.addView(chatView, new FrameLayout.LayoutParams(-1, -1));
+        frame.addView(p2pView, new FrameLayout.LayoutParams(-1, -1));
         setContentView(frame);
         syncViewVisibility();
     }
@@ -207,15 +230,21 @@ public class MainActivity extends Activity implements Core.Listener {
         LinearLayout.LayoutParams qrRowLp = new LinearLayout.LayoutParams(-1, -2);
         qrRowLp.topMargin = dp(8);
 
-        Button lanQrBtn = compactBtn("📱 局域网/热点二维码");
+        Button lanQrBtn = compactBtn("📱 局域网码");
         lanQrBtn.setOnClickListener(v -> openLanQrDialog());
         LinearLayout.LayoutParams q1Lp = new LinearLayout.LayoutParams(0, -2, 1);
-        q1Lp.rightMargin = dp(6);
+        q1Lp.rightMargin = dp(4);
         qrRow.addView(lanQrBtn, q1Lp);
 
-        Button p2pQrBtn = compactBtn("🌐 P2P 信令服务码");
+        Button p2pQrBtn = compactBtn("🌐 P2P 码");
         p2pQrBtn.setOnClickListener(v -> openP2pQrDialog());
-        qrRow.addView(p2pQrBtn, new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout.LayoutParams q2Lp = new LinearLayout.LayoutParams(0, -2, 1);
+        q2Lp.rightMargin = dp(4);
+        qrRow.addView(p2pQrBtn, q2Lp);
+
+        Button p2pOpenBtn = compactBtn("⚡ 内置 P2P");
+        p2pOpenBtn.setOnClickListener(v -> openP2pMode());
+        qrRow.addView(p2pOpenBtn, new LinearLayout.LayoutParams(0, -2, 1));
         pinCard.addView(qrRow, qrRowLp);
 
         relayBar = new TextView(this);
@@ -433,6 +462,79 @@ public class MainActivity extends Activity implements Core.Listener {
         return root;
     }
 
+    View buildP2pView() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.WHITE);
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setBackgroundColor(0xFFEFF6FF);
+        bar.setPadding(dp(8), dp(6), dp(8), dp(6));
+
+        Button back = compactBtn("← 返回");
+        back.setOnClickListener(v -> closeP2pMode());
+        bar.addView(back, new LinearLayout.LayoutParams(-2, -2));
+
+        p2pUrlTitle = new TextView(this);
+        p2pUrlTitle.setText("内置 P2P 模式");
+        p2pUrlTitle.setTextSize(14);
+        p2pUrlTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        p2pUrlTitle.setTextColor(0xFF1E3A8A);
+        p2pUrlTitle.setSingleLine(true);
+        p2pUrlTitle.setEllipsize(TextUtils.TruncateAt.END);
+        p2pUrlTitle.setPadding(dp(8), 0, dp(6), 0);
+        bar.addView(p2pUrlTitle, new LinearLayout.LayoutParams(0, -2, 1));
+
+        Button ref = compactBtn("刷新");
+        ref.setOnClickListener(v -> {
+            if (p2pWebView != null) p2pWebView.reload();
+        });
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-2, -2);
+        rlp.rightMargin = dp(4);
+        bar.addView(ref, rlp);
+
+        Button cfg = compactBtn("改地址");
+        cfg.setOnClickListener(v -> openP2pQrDialog());
+        bar.addView(cfg, new LinearLayout.LayoutParams(-2, -2));
+        root.addView(bar);
+
+        p2pWebView = new WebView(this);
+        WebSettings ws = p2pWebView.getSettings();
+        ws.setJavaScriptEnabled(true);
+        ws.setDomStorageEnabled(true);
+        ws.setAllowFileAccess(true);
+        ws.setMediaPlaybackRequiresUserGesture(false);
+        ws.setCacheMode(WebSettings.LOAD_NO_CACHE);
+        p2pWebView.setWebViewClient(new P2pWebClient(this));
+        p2pWebView.setWebChromeClient(new P2pChromeClient(this));
+        p2pWebView.addJavascriptInterface(new P2pBridge(this), "AndroidApp");
+        root.addView(p2pWebView, new LinearLayout.LayoutParams(-1, 0, 1));
+        return root;
+    }
+
+    void openP2pMode() {
+        String u = core.p2pUrl;
+        if (u == null || u.isEmpty()) {
+            toast("请先填写并保存你的 P2P 信令服务器地址");
+            openP2pQrDialog();
+            return;
+        }
+        inP2pMode = true;
+        activePeerId = null;
+        p2pUrlTitle.setText("⚡ P2P · " + u.replaceFirst("^https?://", ""));
+        if (!u.equals(p2pWebView.getUrl())) {
+            p2pWebView.loadUrl(u);
+        }
+        syncViewVisibility();
+    }
+
+    void closeP2pMode() {
+        inP2pMode = false;
+        syncViewVisibility();
+    }
+
     // ------------------------------------------------------------------ 视图同步
     ArrayList<Core.Msg> activeMessages() {
         return activePeerId == null ? new ArrayList<>() : core.chatOf(activePeerId);
@@ -442,9 +544,10 @@ public class MainActivity extends Activity implements Core.Listener {
         if (activePeerId != null && core.friend(activePeerId) == null) {
             activePeerId = null;
         }
-        boolean inChat = activePeerId != null;
-        homeView.setVisibility(inChat ? View.GONE : View.VISIBLE);
+        boolean inChat = !inP2pMode && activePeerId != null;
+        homeView.setVisibility((!inP2pMode && !inChat) ? View.VISIBLE : View.GONE);
         chatView.setVisibility(inChat ? View.VISIBLE : View.GONE);
+        p2pView.setVisibility(inP2pMode ? View.VISIBLE : View.GONE);
         if (inChat) {
             Core.Device d = core.friend(activePeerId);
             chatTitle.setText(d.label());
@@ -635,7 +738,13 @@ public class MainActivity extends Activity implements Core.Listener {
         new AlertDialog.Builder(this)
                 .setTitle("P2P 信令服务独立二维码")
                 .setView(box)
-                .setPositiveButton("复制地址", (d, w) -> {
+                .setPositiveButton("立即在 App 内打开", (d, w) -> {
+                    core.setP2pUrl(eUrl.getText().toString());
+                    if (core.p2pUrl != null && !core.p2pUrl.isEmpty()) {
+                        openP2pMode();
+                    }
+                })
+                .setNeutralButton("复制地址", (d, w) -> {
                     if (core.p2pUrl != null && !core.p2pUrl.isEmpty()) {
                         copy(core.p2pUrl);
                         toast("已复制 P2P 地址");
@@ -784,6 +893,26 @@ public class MainActivity extends Activity implements Core.Listener {
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
+        if (req == REQ_WEB_FILE) {
+            ValueCallback<Uri[]> cb = webFileCallback;
+            webFileCallback = null;
+            if (cb == null) return;
+            if (res != RESULT_OK || data == null) {
+                cb.onReceiveValue(null);
+                return;
+            }
+            if (data.getClipData() != null) {
+                ClipData cd = data.getClipData();
+                Uri[] uris = new Uri[cd.getItemCount()];
+                for (int i = 0; i < cd.getItemCount(); i++) uris[i] = cd.getItemAt(i).getUri();
+                cb.onReceiveValue(uris);
+            } else if (data.getData() != null) {
+                cb.onReceiveValue(new Uri[]{data.getData()});
+            } else {
+                cb.onReceiveValue(null);
+            }
+            return;
+        }
         if (req != REQ_PICK || res != RESULT_OK || data == null) return;
         if (data.getClipData() != null) {
             ClipData cd = data.getClipData();
@@ -1013,6 +1142,145 @@ public class MainActivity extends Activity implements Core.Listener {
         } else {
             progress.setVisibility(View.VISIBLE);
             progress.setProgress(percent);
+        }
+    }
+
+    // ------------------------------------------------------------------ 内置 P2P WebView 桥接（全部 static，兼容 d8）
+    static class P2pWebClient extends WebViewClient {
+        private final MainActivity act;
+
+        P2pWebClient(MainActivity act) {
+            this.act = act;
+        }
+
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, String url) {
+            String base = act.core.p2pUrl;
+            if (base != null && !base.isEmpty() && url != null) {
+                Uri bu = Uri.parse(base), tu = Uri.parse(url);
+                if (bu.getHost() != null && bu.getHost().equalsIgnoreCase(tu.getHost())) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    static class P2pChromeClient extends WebChromeClient {
+        private final MainActivity act;
+
+        P2pChromeClient(MainActivity act) {
+            this.act = act;
+        }
+
+        @Override
+        public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams params) {
+            if (act.webFileCallback != null) {
+                act.webFileCallback.onReceiveValue(null);
+            }
+            act.webFileCallback = filePathCallback;
+            Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+            i.setType("*/*");
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            try {
+                act.startActivityForResult(Intent.createChooser(i, "选择要通过 P2P 发送的文件"), REQ_WEB_FILE);
+                return true;
+            } catch (ActivityNotFoundException e) {
+                act.webFileCallback = null;
+                act.toast("没有可用的文件选择器");
+                return false;
+            }
+        }
+    }
+
+    static class SaveHandle {
+        File tmp;
+        File dest;
+        FileOutputStream fos;
+    }
+
+    static class P2pBridge {
+        private final MainActivity act;
+        private final HashMap<String, SaveHandle> saves = new HashMap<>();
+
+        P2pBridge(MainActivity act) {
+            this.act = act;
+        }
+
+        @JavascriptInterface
+        public void copyText(final String s) {
+            act.runOnUiThread(() -> act.copy(s == null ? "" : s));
+        }
+
+        @JavascriptInterface
+        public String beginSave(String fileName) {
+            try {
+                File dest = Core.uniqueFile(act.core.saveDir(), Core.safeParts(fileName == null ? "file" : fileName));
+                File parent = dest.getParentFile();
+                if (parent != null) parent.mkdirs();
+                File tmp = new File(dest.getPath() + ".lfpart");
+                SaveHandle h = new SaveHandle();
+                h.dest = dest;
+                h.tmp = tmp;
+                h.fos = new FileOutputStream(tmp);
+                String id = Crypto.toHex(Crypto.randomBytes(8));
+                synchronized (saves) {
+                    saves.put(id, h);
+                }
+                return id;
+            } catch (Exception e) {
+                return "";
+            }
+        }
+
+        @JavascriptInterface
+        public boolean appendSave(String id, String b64Chunk) {
+            SaveHandle h;
+            synchronized (saves) {
+                h = saves.get(id);
+            }
+            if (h == null) return false;
+            try {
+                byte[] data = Base64.decode(b64Chunk, Base64.DEFAULT);
+                h.fos.write(data);
+                return true;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public String finishSave(String id) {
+            SaveHandle h;
+            synchronized (saves) {
+                h = saves.remove(id);
+            }
+            if (h == null) return "";
+            try {
+                h.fos.flush();
+                h.fos.close();
+                if (!h.tmp.renameTo(h.dest)) return "";
+                MediaScannerConnection.scanFile(act.core.ctx, new String[]{h.dest.getAbsolutePath()}, null, null);
+                return h.dest.getName();
+            } catch (Exception e) {
+                //noinspection ResultOfMethodCallIgnored
+                h.tmp.delete();
+                return "";
+            }
+        }
+
+        @JavascriptInterface
+        public void abortSave(String id) {
+            SaveHandle h;
+            synchronized (saves) {
+                h = saves.remove(id);
+            }
+            if (h != null) {
+                Core.closeQuietly(h.fos);
+                //noinspection ResultOfMethodCallIgnored
+                h.tmp.delete();
+            }
         }
     }
 
