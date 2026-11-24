@@ -198,13 +198,14 @@ public class Crypto {
         return new BigInteger(1, md.digest()).mod(nm1).add(BigInteger.ONE);
     }
 
-    public static String pinRouteTag(String pin, String relayKey) throws Exception {
-        MessageDigest md = MessageDigest.getInstance("SHA-256");
-        md.update("lanfast-route|".getBytes(UTF8));
-        md.update((relayKey == null ? "" : relayKey).getBytes(UTF8));
-        md.update("|".getBytes(UTF8));
-        md.update(pin.getBytes(UTF8));
-        return toHex(md.digest()).substring(0, 32);
+    static final String ROUTE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+    public static String generateRouteCode(int len) {
+        StringBuilder sb = new StringBuilder(len);
+        for (int i = 0; i < len; i++) {
+            sb.append(ROUTE_ALPHABET.charAt(RNG.nextInt(ROUTE_ALPHABET.length())));
+        }
+        return sb.toString();
     }
 
     static String hmacHex(byte[] key, String msg) throws Exception {

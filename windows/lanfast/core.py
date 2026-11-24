@@ -44,6 +44,19 @@ def generate_pin():
     return f"{secrets.randbelow(1_000_000):06d}"
 
 
+def parse_pair_input(raw):
+    """解析用户输入的配对码：
+      - '482915'           -> (route_code='', pin='482915')   仅局域网直连
+      - 'K7M9-482915'      -> (route_code='K7M9', pin='482915') 局域网优先，跨网走中转
+      - 'K7M9 482915' / 'K7M9482915' -> 同上
+    """
+    s = re.sub(r"[\s\-]+", "", (raw or "").strip().upper())
+    m = re.fullmatch(r"([A-Z0-9]{4})?(\d{6})", s)
+    if not m:
+        return None, None
+    return (m.group(1) or ""), m.group(2)
+
+
 def parse_relay_addr(addr):
     """解析 'host:port'、'tls://host:port' 或 'host'，返回 (host, port, use_tls) 或 None。"""
     s = (addr or "").strip()
@@ -242,6 +255,7 @@ class LanFastCore:
         self.web_port = web_port
         self.web = WebBridge(self, port=web_port) if web_port else None
         self.pin = pin or generate_pin()
+        self.route_code = crypto.generate_route_code()  # 与 pin 数学完全独立，仅用于中转路由
         self.boot_id = secrets.token_hex(4)
 
         self.relay_addr = (relay_addr or "").strip()
@@ -307,6 +321,7 @@ class LanFastCore:
     def regenerate_pin(self, disconnect_all=False):
         with self._lock:
             self.pin = generate_pin()
+            self.route_code = crypto.generate_route_code()
             self._fail_state.clear()
             if disconnect_all:
                 self.boot_id = secrets.token_hex(4)
@@ -365,7 +380,7 @@ class LanFastCore:
         try:
             with self._relay_send_lock:
                 send_frame(s, {"app": APP, "type": "relay_update",
-                               "pin_tag": crypto.pin_route_tag(self.pin, self.relay_key),
+                               "route_code": self.route_code,
                                "name": self.name, "boot": self.boot_id})
         except OSError:
             pass
@@ -379,7 +394,7 @@ class LanFastCore:
                 s.settimeout(25)
                 reg = {"app": APP, "type": "relay_register", "key": key,
                        "id": self.id, "name": self.name, "os": OS_NAME,
-                       "pin_tag": crypto.pin_route_tag(self.pin, key), "boot": self.boot_id}
+                       "route_code": self.route_code, "boot": self.boot_id}
                 send_frame(s, reg)
                 ack = recv_frame(s)
                 if not ack or not ack.get("ok"):
@@ -433,7 +448,7 @@ class LanFastCore:
         except OSError:
             pass
 
-    def _open_relay_tunnel(self, to_id="", pin=""):
+    def _open_relay_tunnel(self, to_id="", route_code=""):
         parsed = parse_relay_addr(self.relay_addr)
         if not parsed:
             raise ConnectionError("未配置公网中转服务器")
@@ -443,8 +458,8 @@ class LanFastCore:
         req = {"app": APP, "type": "tunnel_open", "key": self.relay_key, "from": self.id}
         if to_id:
             req["to"] = to_id
-        if pin:
-            req["pin_tag"] = crypto.pin_route_tag(pin, self.relay_key)
+        if route_code:
+            req["route_code"] = route_code.strip().upper()
         send_frame(s, req)
         ack = recv_frame(s)
         if not ack or not ack.get("ok"):
@@ -609,13 +624,14 @@ class LanFastCore:
         )
         return True, dev, None
 
-    def pair_by_pin(self, pin, manual_ip="", port=TRANSFER_PORT):
-        pin = (pin or "").strip()
+    def pair_by_pin(self, raw_code, manual_ip="", port=TRANSFER_PORT, route_code=""):
+        parsed_rc, pin = parse_pair_input(raw_code)
+        rc = (route_code or parsed_rc or "").strip().upper()
         manual_ip = (manual_ip or "").strip()
 
         def run():
-            if not re.fullmatch(r"\d{6}", pin):
-                self._emit("pair_result", {"ok": False, "error": "请输入完整的 6 位数字验证码"})
+            if not pin:
+                self._emit("pair_result", {"ok": False, "error": "格式错误：局域网请输 6 位验证码（如 482915），跨网中转请输 路由码-6位码（如 K7M9-482915）"})
                 return
             if manual_ip:
                 try:
@@ -657,21 +673,24 @@ class LanFastCore:
                             last_err = err
 
             if parse_relay_addr(self.relay_addr):
-                try:
-                    with self._open_relay_tunnel(pin=pin) as s:
-                        ok, dev, err = self._do_pair_over_socket(s, pin, "", TRANSFER_PORT, True)
-                    if ok:
-                        with self._lock:
-                            d_lan = self._discovered.get(dev.id)
-                            if d_lan:
-                                dev.ip, dev.port, dev.via_relay = d_lan.ip, d_lan.port, False
-                        self._save_paired(dev, "公网中转")
-                        return
-                    last_err = err
-                except Exception as e:  # noqa
-                    last_err = str(e)
+                if not rc:
+                    last_err = (last_err or "局域网未发现该设备") + "\n（若走公网中转，请输入对方完整中转码，如 K7M9-482915）"
+                else:
+                    try:
+                        with self._open_relay_tunnel(route_code=rc) as s:
+                            ok, dev, err = self._do_pair_over_socket(s, pin, "", TRANSFER_PORT, True)
+                        if ok:
+                            with self._lock:
+                                d_lan = self._discovered.get(dev.id)
+                                if d_lan:
+                                    dev.ip, dev.port, dev.via_relay = d_lan.ip, d_lan.port, False
+                            self._save_paired(dev, "公网中转")
+                            return
+                        last_err = err
+                    except Exception as e:  # noqa
+                        last_err = str(e)
 
-            msg = last_err or "未找到该 6 位验证码对应的设备。\n请确认在同一 WiFi（或已连接同一公网中转），或填写对方 IP。"
+            msg = last_err or "未找到对应设备。\n局域网内请确认在同一 WiFi；跨公网中转请输入对方完整码（如 K7M9-482915）。"
             self._emit("pair_result", {"ok": False, "error": msg})
 
         threading.Thread(target=run, daemon=True).start()

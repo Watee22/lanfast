@@ -123,15 +123,17 @@ def dec_point(raw: bytes):
 
 
 # ----------------------------------------------------------------- SPAKE2-P256 核心
+# 32 字符去混淆字母表（不含 0/O/1/I/L），4 位随机路由码与 6 位 SPAKE2 PIN 数学完全独立
+ROUTE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+
+
+def generate_route_code(length: int = 4) -> str:
+    return "".join(secrets.choice(ROUTE_ALPHABET) for _ in range(length))
+
+
 def pin_to_scalar(pin: str) -> int:
     h = hashlib.sha256(b"lanfast-spake2-w|" + pin.encode("utf-8")).digest()
     return (int.from_bytes(h, "big") % (N - 1)) + 1
-
-
-def pin_route_tag(pin: str, relay_key: str = "") -> str:
-    """中转服务器按此哈希索引在线设备，绝不向中转服发送明文 6 位验证码。"""
-    h = hashlib.sha256(b"lanfast-route|" + relay_key.encode("utf-8") + b"|" + pin.encode("utf-8")).hexdigest()
-    return h[:32]
 
 
 def sas_from_digest(digest: bytes) -> str:

@@ -148,6 +148,7 @@ public class Core {
     public final String id;
     public volatile String bootId;
     public volatile String pin;
+    public volatile String routeCode; // 与 pin 数学完全独立，仅用于中转路由
     public volatile String name;
     public volatile String relayAddr;
     public volatile String relayKey;
@@ -193,6 +194,7 @@ public class Core {
         id = i;
         bootId = randomHex(4);
         pin = generatePin();
+        routeCode = Crypto.generateRouteCode(4);
         name = prefs.getString("name", Build.MODEL);
         relayAddr = prefs.getString("relay_addr", "");
         relayKey = prefs.getString("relay_key", "");
@@ -309,11 +311,20 @@ public class Core {
 
     public String regeneratePin() {
         pin = generatePin();
+        routeCode = Crypto.generateRouteCode(4);
         synchronized (failMap) {
             failMap.clear();
         }
         sendRelayUpdate();
         return pin;
+    }
+
+    public String displayCode() {
+        return relayConnected ? (routeCode + "-" + pin) : fmtPin(pin);
+    }
+
+    public String copyableCode() {
+        return relayConnected ? (routeCode + "-" + pin) : pin;
     }
 
     public void setName(String n) {
@@ -444,7 +455,7 @@ public class Core {
                 JSONObject j = new JSONObject();
                 j.put("app", APP);
                 j.put("type", "relay_update");
-                j.put("pin_tag", Crypto.pinRouteTag(pin, relayKey));
+                j.put("route_code", routeCode);
                 j.put("name", name);
                 j.put("boot", bootId);
                 synchronized (relayWriteLock) {
@@ -471,7 +482,7 @@ public class Core {
                 reg.put("id", id);
                 reg.put("name", name);
                 reg.put("os", "android");
-                reg.put("pin_tag", Crypto.pinRouteTag(pin, key));
+                reg.put("route_code", routeCode);
                 reg.put("boot", bootId);
                 synchronized (relayWriteLock) {
                     writeFrame(out, reg);
@@ -541,7 +552,7 @@ public class Core {
         }
     }
 
-    private Socket openRelayTunnel(String toId, String targetPin) throws Exception {
+    private Socket openRelayTunnel(String toId, String targetRouteCode) throws Exception {
         HostPort hp = parseRelay(relayAddr);
         if (hp == null) throw new IOException("未配置公网中转服务器");
         Socket s = null;
@@ -556,7 +567,7 @@ public class Core {
             req.put("key", relayKey);
             req.put("from", id);
             if (toId != null && !toId.isEmpty()) req.put("to", toId);
-            if (targetPin != null && !targetPin.isEmpty()) req.put("pin_tag", Crypto.pinRouteTag(targetPin, relayKey));
+            if (targetRouteCode != null && !targetRouteCode.isEmpty()) req.put("route_code", targetRouteCode.trim().toUpperCase(Locale.US));
             writeFrame(out, req);
             JSONObject ack = readFrame(in);
             if (ack == null || !ack.optBoolean("ok")) {
@@ -894,19 +905,29 @@ public class Core {
         return r;
     }
 
-    public void pairByPin(final String targetPin, final String manualIp, final PairCallback cb) {
-        final String cleanPin = targetPin == null ? "" : targetPin.trim().replace(" ", "");
+    public void pairByPin(final String rawCode, final String manualIp, final PairCallback cb) {
+        final String stripped = rawCode == null ? "" : rawCode.trim().toUpperCase(Locale.US).replaceAll("[\\s\\-]+", "");
         final String cleanIp = manualIp == null ? "" : manualIp.trim();
         pool.execute(() -> {
-            if (!cleanPin.matches("\\d{6}")) {
-                postPair(cb, false, null, "请输入完整的 6 位数字验证码");
+            String parsedRc = "";
+            String cleanPin = "";
+            if (stripped.matches("\\d{6}")) {
+                cleanPin = stripped;
+            } else if (stripped.matches("[A-Z0-9]{4}\\d{6}")) {
+                parsedRc = stripped.substring(0, 4);
+                cleanPin = stripped.substring(4);
+            } else {
+                postPair(cb, false, null, "格式错误：局域网请输 6 位数字（如 482915），跨网中转请输 路由码-6位码（如 K7M9-482915）");
                 return;
             }
+            final String pinFinal = cleanPin;
+            final String rcFinal = parsedRc;
+
             if (!cleanIp.isEmpty()) {
                 try (Socket s = new Socket()) {
                     s.connect(new InetSocketAddress(cleanIp, TRANSFER_PORT), 4000);
                     s.setSoTimeout(5000);
-                    PairTry r = doPairOverSocket(s, cleanPin, cleanIp, TRANSFER_PORT, false);
+                    PairTry r = doPairOverSocket(s, pinFinal, cleanIp, TRANSFER_PORT, false);
                     if (r.ok) {
                         saveFriend(r.device);
                         postPair(cb, true, r.device, "已添加好友 " + r.device.name + "（局域网直连）");
@@ -919,7 +940,6 @@ public class Core {
                 return;
             }
 
-            // 1) 优先在局域网已发现设备中并发匹配
             List<Device> cands;
             synchronized (discovered) {
                 cands = new ArrayList<>(discovered.values());
@@ -941,7 +961,7 @@ public class Core {
                         try (Socket s = new Socket()) {
                             s.connect(new InetSocketAddress(cand.ip, cand.port), 2500);
                             s.setSoTimeout(4000);
-                            PairTry r = doPairOverSocket(s, cleanPin, cand.ip, cand.port, false);
+                            PairTry r = doPairOverSocket(s, pinFinal, cand.ip, cand.port, false);
                             if (r.ok) winner.compareAndSet(null, r);
                             else if (r.error != null) lastErr.set(r.error);
                         } catch (Exception e) {
@@ -963,24 +983,28 @@ public class Core {
                 }
             }
 
-            // 2) 局域网未命中，若配置了公网中转，通过中转按 6 位码查找对方
             if (parseRelay(relayAddr) != null) {
-                try (Socket s = openRelayTunnel("", cleanPin)) {
-                    PairTry r = doPairOverSocket(s, cleanPin, "", TRANSFER_PORT, true);
-                    if (r.ok) {
-                        saveFriend(r.device);
-                        postPair(cb, true, r.device, "已添加好友 " + r.device.name + "（公网中转）");
-                        return;
+                if (rcFinal.isEmpty()) {
+                    lastErr.set((lastErr.get() != null ? lastErr.get() : "局域网未发现该设备")
+                            + "\n（若走公网中转，请输入对方完整中转码，如 K7M9-482915）");
+                } else {
+                    try (Socket s = openRelayTunnel("", rcFinal)) {
+                        PairTry r = doPairOverSocket(s, pinFinal, "", TRANSFER_PORT, true);
+                        if (r.ok) {
+                            saveFriend(r.device);
+                            postPair(cb, true, r.device, "已添加好友 " + r.device.name + "（公网中转）");
+                            return;
+                        }
+                        lastErr.set(r.error);
+                    } catch (Exception e) {
+                        lastErr.set(e.getMessage());
                     }
-                    lastErr.set(r.error);
-                } catch (Exception e) {
-                    lastErr.set(e.getMessage());
                 }
             }
 
             String err = lastErr.get();
             if (err == null || err.isEmpty()) {
-                err = "未找到该 6 位验证码对应的设备。\n请确认在同一 WiFi（或已连接同一公网中转），或填写对方 IP。";
+                err = "未找到对应设备。\n同局域网请确认在同一 WiFi；跨公网中转请输入对方完整码（如 K7M9-482915）。";
             }
             postPair(cb, false, null, err);
         });

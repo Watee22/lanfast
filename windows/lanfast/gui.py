@@ -81,11 +81,11 @@ class AddFriendDialog(tk.Toplevel):
         body = ttk.Frame(self, padding=16)
         body.pack(fill="both", expand=True)
 
-        ttk.Label(body, text="对方设备屏幕顶部显示的 6 位数字验证码：",
-                  font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(body, text="对方设备屏幕上的验证码：\n• 同局域网：输 6 位数字（如 482915）\n• 跨公网中转：输 路由码-6位码（如 K7M9-482915）",
+                  font=("Microsoft YaHei UI", 9, "bold"), justify="left").pack(anchor="w")
         self.pin_var = tk.StringVar()
-        e_pin = tk.Entry(body, textvariable=self.pin_var, font=("Consolas", 20, "bold"),
-                         fg="#2563eb", justify="center", width=12)
+        e_pin = tk.Entry(body, textvariable=self.pin_var, font=("Consolas", 18, "bold"),
+                         fg="#2563eb", justify="center", width=16)
         e_pin.pack(fill="x", pady=(6, 12))
         e_pin.focus_set()
 
@@ -102,12 +102,14 @@ class AddFriendDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
 
     def submit(self):
-        pin = self.pin_var.get().strip().replace(" ", "")
+        raw = self.pin_var.get().strip().upper()
         ip = self.ip_var.get().strip()
-        if len(pin) != 6 or not pin.isdigit():
-            messagebox.showwarning("LanFast", "请输入完整的 6 位数字验证码", parent=self)
+        from .core import parse_pair_input
+        _rc, pin = parse_pair_input(raw)
+        if not pin:
+            messagebox.showwarning("LanFast", "格式不正确：\n局域网请输 6 位数字（如 482915），\n跨网中转请输 路由码-6位码（如 K7M9-482915）。", parent=self)
             return
-        self.on_submit(pin, ip)
+        self.on_submit(raw, ip)
         self.destroy()
 
 
@@ -455,12 +457,18 @@ class App:
             pass
         self.root.after(80, self._poll)
 
-    def ev_pin(self, pin):
-        self.pin_label.config(text=fmt_pin(pin))
+    def _display_code(self):
+        if self.core.relay_connected:
+            return f"{self.core.route_code}-{self.core.pin}"
+        return fmt_pin(self.core.pin)
+
+    def ev_pin(self, _pin):
+        self.pin_label.config(text=self._display_code())
 
     def ev_relay_state(self, d):
         dot = "● " if d.get("connected") else "○ "
         self.relay_btn.config(text=dot + ("公网中转已连" if d.get("connected") else "公网中转设置"))
+        self.pin_label.config(text=self._display_code())
         self.set_status(d.get("text", ""))
 
     def ev_devices(self, devs):
@@ -637,8 +645,9 @@ class App:
         self.set_status(f"本机新验证码：{self.core.pin}（已有好友不受影响）")
 
     def copy_pin(self):
-        self.copy(self.core.pin)
-        self.set_status(f"已复制验证码 {self.core.pin}")
+        code = f"{self.core.route_code}-{self.core.pin}" if self.core.relay_connected else self.core.pin
+        self.copy(code)
+        self.set_status(f"已复制验证码 {code}")
 
     def send_text(self):
         text = self.input.get("1.0", "end-1c")

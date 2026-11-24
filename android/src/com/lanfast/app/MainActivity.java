@@ -169,8 +169,9 @@ public class MainActivity extends Activity implements Core.Listener {
         myPinText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         myPinText.setTextColor(BLUE);
         myPinText.setOnClickListener(v -> {
-            copy(core.pin);
-            toast("已复制本机验证码 " + core.pin);
+            String code = core.copyableCode();
+            copy(code);
+            toast("已复制验证码 " + code);
         });
         pinLeft.addView(myPinText);
         pinRow.addView(pinLeft, new LinearLayout.LayoutParams(0, -2, 1));
@@ -180,8 +181,8 @@ public class MainActivity extends Activity implements Core.Listener {
         refPin.setTextSize(12);
         refPin.setOnClickListener(v -> {
             core.regeneratePin();
-            myPinText.setText(Core.fmtPin(core.pin));
-            toast("验证码已刷新为 " + core.pin);
+            myPinText.setText(core.displayCode());
+            toast("验证码已刷新为 " + core.copyableCode());
         });
         pinRow.addView(refPin, new LinearLayout.LayoutParams(-2, -2));
         pinCard.addView(pinRow);
@@ -472,7 +473,7 @@ public class MainActivity extends Activity implements Core.Listener {
     }
 
     void refreshAllUi() {
-        myPinText.setText(Core.fmtPin(core.pin));
+        myPinText.setText(core.displayCode());
         renderRelayBar(core.relayConnected, core.relayStatusText);
         refreshFriendsList();
         renderFooter();
@@ -489,6 +490,7 @@ public class MainActivity extends Activity implements Core.Listener {
     void renderRelayBar(boolean connected, String text) {
         relayBar.setText((connected ? "● " : "○ ") + text);
         relayBar.setTextColor(connected ? 0xFF065F46 : 0xFF475569);
+        if (myPinText != null) myPinText.setText(core.displayCode());
     }
 
     void renderFooter() {
@@ -649,18 +651,18 @@ public class MainActivity extends Activity implements Core.Listener {
         box.setPadding(dp(20), dp(12), dp(20), dp(4));
 
         TextView l1 = new TextView(this);
-        l1.setText("对方屏幕上的 6 位数字验证码：");
-        l1.setTextSize(13);
+        l1.setText("对方验证码：\n• 同局域网输 6 位数字（如 482915）\n• 跨公网中转输 路由码-6位码（如 K7M9-482915）");
+        l1.setTextSize(12);
         box.addView(l1);
 
         final EditText ePin = new EditText(this);
-        ePin.setHint("000000");
+        ePin.setHint("482915 或 K7M9-482915");
         ePin.setGravity(Gravity.CENTER);
-        ePin.setTextSize(24);
+        ePin.setTextSize(20);
         ePin.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         ePin.setTextColor(BLUE);
-        ePin.setInputType(InputType.TYPE_CLASS_NUMBER);
-        ePin.setFilters(new InputFilter[]{new InputFilter.LengthFilter(6)});
+        ePin.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
+        ePin.setFilters(new InputFilter[]{new InputFilter.LengthFilter(14)});
         box.addView(ePin);
 
         TextView l2 = new TextView(this);
@@ -801,10 +803,12 @@ public class MainActivity extends Activity implements Core.Listener {
             Uri data = intent.getData();
             if ("lanfast".equals(data.getScheme()) && "pair".equals(data.getHost())) {
                 String pin = data.getQueryParameter("pin");
+                String route = data.getQueryParameter("route");
                 String ip = data.getQueryParameter("ip");
                 if (pin != null && pin.matches("\\d{6}")) {
+                    String combined = (route != null && route.matches("[A-Za-z0-9]{4}")) ? (route + "-" + pin) : pin;
                     toast("扫码自动 SPAKE2 验证中…");
-                    core.pairByPin(pin, ip == null ? "" : ip, (ok, dev, msg) -> {
+                    core.pairByPin(combined, ip == null ? "" : ip, (ok, dev, msg) -> {
                         toast(msg);
                         if (ok && dev != null) openChat(dev.id);
                     });

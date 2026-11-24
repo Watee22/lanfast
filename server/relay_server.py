@@ -48,11 +48,11 @@ async def write_frame(writer: asyncio.StreamWriter, obj: dict):
 
 
 class ClientInfo:
-    def __init__(self, device_id, name, os_, pin_tag, boot, writer, ip):
+    def __init__(self, device_id, name, os_, route_code, boot, writer, ip):
         self.id = device_id
         self.name = name
         self.os = os_
-        self.pin_tag = pin_tag  # SHA-256 加盐哈希，服务端不接触明文 6 位码
+        self.route_code = route_code.upper()  # 与 SPAKE2 PIN 完全无关的随机路由码
         self.boot = boot
         self.writer = writer
         self.ip = ip
@@ -86,9 +86,10 @@ class RelayServer:
             return True
         return hmac.compare_digest(str(msg.get("key", "")), self.server_key)
 
-    def _find_by_tag(self, pin_tag: str, exclude_id: str = ""):
+    def _find_by_route(self, route_code: str, exclude_id: str = ""):
+        rc = route_code.upper()
         for c in self.clients.values():
-            if c.id != exclude_id and c.pin_tag and hmac.compare_digest(c.pin_tag, pin_tag):
+            if c.id != exclude_id and c.route_code and hmac.compare_digest(c.route_code, rc):
                 return c
         return None
 
@@ -129,9 +130,9 @@ class RelayServer:
         if not did:
             await write_frame(writer, {"ok": False, "error": "missing device id"})
             return
-        tag = str(first.get("pin_tag", ""))
+        rc = str(first.get("route_code", "")).strip().upper()
         info = ClientInfo(did, first.get("name", "?"), first.get("os", "?"),
-                          tag, str(first.get("boot", "")), writer, ip)
+                          rc, str(first.get("boot", "")), writer, ip)
         old = self.clients.get(did)
         if old is not None and old.writer is not writer:
             try:
@@ -148,8 +149,8 @@ class RelayServer:
                 if mt == "relay_ping":
                     await info.send({"type": "relay_pong", "ok": True, "online": len(self.clients)})
                 elif mt == "relay_update":
-                    if "pin_tag" in msg:
-                        info.pin_tag = str(msg["pin_tag"])
+                    if "route_code" in msg:
+                        info.route_code = str(msg["route_code"]).strip().upper()
                     if "name" in msg:
                         info.name = str(msg["name"])
                     if "boot" in msg:
@@ -166,7 +167,7 @@ class RelayServer:
         now = time.time()
         from_id = str(first.get("from", ""))
         to_id = str(first.get("to", ""))
-        pin_tag = str(first.get("pin_tag", "")).strip()
+        route_code = str(first.get("route_code", "")).strip().upper()
 
         target = None
         if to_id:
@@ -174,25 +175,25 @@ class RelayServer:
             if target is None:
                 await write_frame(writer, {"ok": False, "error": "对方当前未连接到中转服务器"})
                 return True
-        elif pin_tag:
+        elif route_code:
             fails, lock_until = self.fail_state.get(ip, (0, 0.0))
             if now < lock_until:
                 wait = int(lock_until - now) + 1
-                await write_frame(writer, {"ok": False, "error": f"验证码尝试次数过多，请 {wait} 秒后再试"})
+                await write_frame(writer, {"ok": False, "error": f"尝试次数过多，请 {wait} 秒后再试"})
                 return True
-            target = self._find_by_tag(pin_tag, exclude_id=from_id)
+            target = self._find_by_route(route_code, exclude_id=from_id)
             if target is None:
                 fails += 1
                 if fails >= MAX_PIN_FAILS:
                     self.fail_state[ip] = (0, now + PIN_LOCK_SECONDS)
-                    await write_frame(writer, {"ok": False, "error": f"验证码错误次数过多，请 {PIN_LOCK_SECONDS} 秒后再试"})
+                    await write_frame(writer, {"ok": False, "error": f"路由码错误次数过多，请 {PIN_LOCK_SECONDS} 秒后再试"})
                 else:
                     self.fail_state[ip] = (fails, 0.0)
-                    await write_frame(writer, {"ok": False, "error": "中转服务器上未找到该验证码对应的在线设备"})
+                    await write_frame(writer, {"ok": False, "error": f"中转服务器上未找到路由码 {route_code} 对应的在线设备"})
                 return True
             self.fail_state.pop(ip, None)
         else:
-            await write_frame(writer, {"ok": False, "error": "缺少目标设备或路由索引"})
+            await write_frame(writer, {"ok": False, "error": "缺少目标设备或中转路由码"})
             return True
 
         stream_id = secrets.token_hex(12)
