@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Android build artifacts & private signing keys
+android/build/
+android/*.keystore
+android/*.jks
+android/*.apk
+android/*.idsig
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
