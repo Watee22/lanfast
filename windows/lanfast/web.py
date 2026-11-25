@@ -369,12 +369,22 @@ function addMsg({ dir, kind, text, fileName, size, url, isImage }) {
       a.textContent = "下载保存";
       fc.appendChild(a);
     }
+    const fops = document.createElement("div");
+    fops.style.display = "flex"; fops.style.gap = "12px";
+    if (url) {
+      const alt = document.createElement("div");
+      alt.className = "copy-tag";
+      alt.textContent = "兼容下载";
+      alt.onclick = () => compatDownload(url, fileName);
+      fops.appendChild(alt);
+    }
     const del = document.createElement("div");
     del.className = "copy-tag";
     del.style.color = "#ef4444";
     del.textContent = "删除";
     del.onclick = () => row.remove();
-    fc.appendChild(del);
+    fops.appendChild(del);
+    fc.appendChild(fops);
     bub.appendChild(fc);
   } else {
     const span = document.createElement("div");
@@ -495,6 +505,51 @@ function leaveChat(reason) {
   $("loginErr").textContent = reason || "";
 }
 
+async function compatDownload(url, fileName) {
+  try {
+    setStatus("正在兼容模式下载 " + fileName + "…", 0);
+    const r = await fetch(url);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const total = Number(r.headers.get("Content-Length") || 0);
+    let blob;
+    if (r.body && r.body.getReader) {
+      const reader = r.body.getReader();
+      const chunks = [];
+      let got = 0, lastUi = 0;
+      const t0 = Date.now();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        got += value.byteLength;
+        const now = Date.now();
+        if (now - lastUi > 120) {
+          lastUi = now;
+          const pct = total > 0 ? Math.round(got * 100 / total) : 50;
+          const spd = got / Math.max((now - t0) / 1000, 0.05);
+          setStatus(`兼容下载 ${fileName}  ${human(got)}${total ? "/" + human(total) : ""}  ${human(spd)}/s`, pct);
+        }
+      }
+      blob = new Blob(chunks, { type: r.headers.get("Content-Type") || "application/octet-stream" });
+    } else {
+      blob = await r.blob();
+    }
+    const burl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = burl;
+    a.download = fileName || "file";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(burl), 60000);
+    setStatus("已触发保存：" + fileName, 100);
+    setTimeout(() => setStatus("就绪", -1), 1500);
+  } catch (e) {
+    setStatus("兼容下载失败：" + e.message, -1);
+    showToast("兼容下载失败：" + e.message);
+  }
+}
+
 function startEvents() {
   if (state.es) state.es.close();
   const es = new EventSource("/api/events?token=" + encodeURIComponent(state.token));
@@ -507,7 +562,8 @@ function startEvents() {
       addMsg({ dir: "in", kind: "text", text: m.text });
       setStatus("收到来自 " + state.peerName + " 的文字");
     } else if (m.type === "file") {
-      const url = "/api/download/" + encodeURIComponent(m.fid) + "?token=" + encodeURIComponent(state.token);
+      const baseName = (m.fileName || "file").split(/[\\/]/).pop() || "file";
+      const url = "/api/download/" + encodeURIComponent(m.fid) + "/" + encodeURIComponent(baseName) + "?token=" + encodeURIComponent(state.token);
       addMsg({ dir: "in", kind: "file", fileName: m.fileName, size: m.size, url, isImage: m.isImage });
       setStatus("收到文件：" + m.fileName);
     } else if (m.type === "kicked") {
@@ -631,6 +687,52 @@ initInfo();
 """
 
 
+def _ascii_fallback_name(fname: str) -> str:
+    """生成纯 ASCII 兜底文件名（保留扩展名），避免部分安卓/Quest 下载器无法解析纯 filename*。"""
+    base = os.path.basename(fname or "file")
+    stem, ext = os.path.splitext(base)
+    safe_stem = "".join(ch if ("0" <= ch <= "9" or "A" <= ch <= "Z" or "a" <= ch <= "z" or ch in "._-") else "_" for ch in stem).strip("_")
+    safe_ext = "".join(ch if ("0" <= ch <= "9" or "A" <= ch <= "Z" or "a" <= ch <= "z" or ch == ".") else "" for ch in ext)
+    if not safe_stem:
+        safe_stem = "download"
+    return (safe_stem[:80] + safe_ext[:16]) or "download"
+
+
+def _parse_range_header(range_hdr: str, total_size: int):
+    """解析单段 HTTP Range 头：返回 None（无 Range）、'invalid'（416）或 (start, end) 闭区间。"""
+    if not range_hdr:
+        return None
+    hdr = range_hdr.strip()
+    if not hdr.lower().startswith("bytes="):
+        return None
+    spec = hdr[6:].split(",", 1)[0].strip()
+    if "-" not in spec:
+        return "invalid"
+    if total_size <= 0:
+        return "invalid"
+    s_part, e_part = spec.split("-", 1)
+    s_part, e_part = s_part.strip(), e_part.strip()
+    try:
+        if not s_part:
+            # 后缀范围：bytes=-500
+            suffix = int(e_part)
+            if suffix <= 0:
+                return "invalid"
+            start = max(0, total_size - suffix)
+            end = total_size - 1
+        else:
+            start = int(s_part)
+            end = int(e_part) if e_part else (total_size - 1)
+            if start < 0 or start >= total_size:
+                return "invalid"
+            if end < start:
+                return "invalid"
+            end = min(end, total_size - 1)
+        return (start, end)
+    except ValueError:
+        return "invalid"
+
+
 class WebClient:
     def __init__(self, device_id, name, ip, token):
         self.id = device_id
@@ -676,6 +778,93 @@ class WebBridge:
                 if not tok and qs:
                     tok = (qs.get("token") or [""])[0]
                 return bridge.get_by_token(tok)
+
+            def _serve_download(self, path, qs, head_only=False):
+                cli = self._auth(qs)
+                if not cli:
+                    self.send_error(403, "Forbidden")
+                    return
+                raw_tail = path[len("/api/download/"):]
+                fid = unquote(raw_tail.split("/", 1)[0])
+                with bridge._lock:
+                    entry = cli.files.get(fid)
+                if not entry or not os.path.isfile(entry[0]):
+                    self.send_error(404, "File not found")
+                    return
+                abspath, rel_name, _cached_size = entry
+                try:
+                    size = os.path.getsize(abspath)
+                except OSError:
+                    self.send_error(404, "File not found")
+                    return
+                fname = os.path.basename(rel_name)
+                ascii_name = _ascii_fallback_name(fname)
+                inline = (qs.get("inline") or ["0"])[0] == "1"
+                mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+                disp = "inline" if inline else "attachment"
+                rng = _parse_range_header(self.headers.get("Range", ""), size)
+                if rng == "invalid":
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
+                    self.end_headers()
+                    return
+                if rng is not None:
+                    start, end = rng
+                    length = end - start + 1
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                else:
+                    start, length = 0, size
+                    self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("ETag", f'"{fid}"')
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header(
+                    "Content-Disposition",
+                    f'{disp}; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(fname)}',
+                )
+                self.send_header("Connection", "close")
+                self.close_connection = True
+                self.end_headers()
+                if head_only or length <= 0:
+                    return
+                try:
+                    with open(abspath, "rb") as f:
+                        if start > 0:
+                            f.seek(start)
+                        rem = length
+                        while rem > 0:
+                            chunk = f.read(min(UPLOAD_CHUNK, rem))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            rem -= len(chunk)
+                    self.wfile.flush()
+                except OSError:
+                    pass
+
+            def do_HEAD(self):
+                parsed = urlparse(self.path)
+                path = parsed.path
+                qs = parse_qs(parsed.query)
+                if path.startswith("/api/download/"):
+                    self._serve_download(path, qs, head_only=True)
+                    return
+                if path in ("/", "/index.html"):
+                    body = HTML_PAGE.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    return
+                self.send_error(404)
 
             def do_GET(self):
                 parsed = urlparse(self.path)
@@ -734,35 +923,7 @@ class WebBridge:
                     return
 
                 if path.startswith("/api/download/"):
-                    cli = self._auth(qs)
-                    if not cli:
-                        self.send_error(403, "Forbidden")
-                        return
-                    fid = unquote(path[len("/api/download/"):])
-                    with bridge._lock:
-                        entry = cli.files.get(fid)
-                    if not entry or not os.path.isfile(entry[0]):
-                        self.send_error(404, "File not found")
-                        return
-                    abspath, rel_name, size = entry
-                    fname = os.path.basename(rel_name)
-                    inline = (qs.get("inline") or ["0"])[0] == "1"
-                    mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
-                    disp = "inline" if inline else "attachment"
-                    self.send_response(200)
-                    self.send_header("Content-Type", mime)
-                    self.send_header("Content-Length", str(size))
-                    self.send_header("Content-Disposition", f"{disp}; filename*=UTF-8''{quote(fname)}")
-                    self.end_headers()
-                    try:
-                        with open(abspath, "rb") as f:
-                            while True:
-                                chunk = f.read(UPLOAD_CHUNK)
-                                if not chunk:
-                                    break
-                                self.wfile.write(chunk)
-                    except OSError:
-                        pass
+                    self._serve_download(path, qs, head_only=False)
                     return
 
                 self.send_error(404)

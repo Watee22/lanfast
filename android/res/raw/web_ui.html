@@ -346,12 +346,22 @@ function addMsg({ dir, kind, text, fileName, size, url, isImage }) {
       a.textContent = "下载保存";
       fc.appendChild(a);
     }
+    const fops = document.createElement("div");
+    fops.style.display = "flex"; fops.style.gap = "12px";
+    if (url) {
+      const alt = document.createElement("div");
+      alt.className = "copy-tag";
+      alt.textContent = "兼容下载";
+      alt.onclick = () => compatDownload(url, fileName);
+      fops.appendChild(alt);
+    }
     const del = document.createElement("div");
     del.className = "copy-tag";
     del.style.color = "#ef4444";
     del.textContent = "删除";
     del.onclick = () => row.remove();
-    fc.appendChild(del);
+    fops.appendChild(del);
+    fc.appendChild(fops);
     bub.appendChild(fc);
   } else {
     const span = document.createElement("div");
@@ -472,6 +482,51 @@ function leaveChat(reason) {
   $("loginErr").textContent = reason || "";
 }
 
+async function compatDownload(url, fileName) {
+  try {
+    setStatus("正在兼容模式下载 " + fileName + "…", 0);
+    const r = await fetch(url);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const total = Number(r.headers.get("Content-Length") || 0);
+    let blob;
+    if (r.body && r.body.getReader) {
+      const reader = r.body.getReader();
+      const chunks = [];
+      let got = 0, lastUi = 0;
+      const t0 = Date.now();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        got += value.byteLength;
+        const now = Date.now();
+        if (now - lastUi > 120) {
+          lastUi = now;
+          const pct = total > 0 ? Math.round(got * 100 / total) : 50;
+          const spd = got / Math.max((now - t0) / 1000, 0.05);
+          setStatus(`兼容下载 ${fileName}  ${human(got)}${total ? "/" + human(total) : ""}  ${human(spd)}/s`, pct);
+        }
+      }
+      blob = new Blob(chunks, { type: r.headers.get("Content-Type") || "application/octet-stream" });
+    } else {
+      blob = await r.blob();
+    }
+    const burl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = burl;
+    a.download = fileName || "file";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(burl), 60000);
+    setStatus("已触发保存：" + fileName, 100);
+    setTimeout(() => setStatus("就绪", -1), 1500);
+  } catch (e) {
+    setStatus("兼容下载失败：" + e.message, -1);
+    showToast("兼容下载失败：" + e.message);
+  }
+}
+
 function startEvents() {
   if (state.es) state.es.close();
   const es = new EventSource("/api/events?token=" + encodeURIComponent(state.token));
@@ -484,7 +539,8 @@ function startEvents() {
       addMsg({ dir: "in", kind: "text", text: m.text });
       setStatus("收到来自 " + state.peerName + " 的文字");
     } else if (m.type === "file") {
-      const url = "/api/download/" + encodeURIComponent(m.fid) + "?token=" + encodeURIComponent(state.token);
+      const baseName = (m.fileName || "file").split(/[\\/]/).pop() || "file";
+      const url = "/api/download/" + encodeURIComponent(m.fid) + "/" + encodeURIComponent(baseName) + "?token=" + encodeURIComponent(state.token);
       addMsg({ dir: "in", kind: "file", fileName: m.fileName, size: m.size, url, isImage: m.isImage });
       setStatus("收到文件：" + m.fileName);
     } else if (m.type === "kicked") {

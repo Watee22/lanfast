@@ -158,8 +158,8 @@ public class WebBridge {
                 parseQuery(fullPath.substring(q + 1), qs);
             }
 
-            if ("GET".equals(method)) {
-                handleGet(path, qs, headers, out, s);
+            if ("GET".equals(method) || "HEAD".equals(method)) {
+                handleGet(path, qs, headers, out, s, "HEAD".equals(method));
             } else if ("POST".equals(method)) {
                 handlePost(path, headers, in, out, ip);
             } else {
@@ -169,10 +169,90 @@ public class WebBridge {
         }
     }
 
+    private static String asciiFallbackName(String fname) {
+        if (fname == null || fname.isEmpty()) return "download";
+        int dot = fname.lastIndexOf('.');
+        String stem = dot > 0 ? fname.substring(0, dot) : fname;
+        String ext = dot > 0 ? fname.substring(dot) : "";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < stem.length() && sb.length() < 80; i++) {
+            char c = stem.charAt(i);
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '.' || c == '_' || c == '-') {
+                sb.append(c);
+            } else {
+                sb.append('_');
+            }
+        }
+        String safeStem = sb.toString().replaceAll("^_+|_+$", "");
+        if (safeStem.isEmpty()) safeStem = "download";
+        StringBuilder eb = new StringBuilder();
+        for (int i = 0; i < ext.length() && eb.length() < 16; i++) {
+            char c = ext.charAt(i);
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '.') eb.append(c);
+        }
+        return safeStem + eb.toString();
+    }
+
+    private static long[] parseRange(String rangeHdr, long totalSize) {
+        if (rangeHdr == null || rangeHdr.isEmpty()) return null;
+        String h = rangeHdr.trim();
+        if (!h.toLowerCase(Locale.US).startsWith("bytes=")) return null;
+        String spec = h.substring(6).trim();
+        int comma = spec.indexOf(',');
+        if (comma >= 0) spec = spec.substring(0, comma).trim();
+        int dash = spec.indexOf('-');
+        if (dash < 0 || totalSize <= 0) return new long[]{-1, -1};
+        String sPart = spec.substring(0, dash).trim();
+        String ePart = spec.substring(dash + 1).trim();
+        try {
+            long start, end;
+            if (sPart.isEmpty()) {
+                long suffix = Long.parseLong(ePart);
+                if (suffix <= 0) return new long[]{-1, -1};
+                start = Math.max(0, totalSize - suffix);
+                end = totalSize - 1;
+            } else {
+                start = Long.parseLong(sPart);
+                end = ePart.isEmpty() ? (totalSize - 1) : Long.parseLong(ePart);
+                if (start < 0 || start >= totalSize || end < start) return new long[]{-1, -1};
+                end = Math.min(end, totalSize - 1);
+            }
+            return new long[]{start, end};
+        } catch (NumberFormatException e) {
+            return new long[]{-1, -1};
+        }
+    }
+
+    private static void skipFully(InputStream is, long n) throws IOException {
+        long rem = n;
+        byte[] tmp = null;
+        while (rem > 0) {
+            long skipped = is.skip(rem);
+            if (skipped > 0) {
+                rem -= skipped;
+            } else {
+                if (tmp == null) tmp = new byte[8192];
+                int r = is.read(tmp, 0, (int) Math.min(tmp.length, rem));
+                if (r < 0) break;
+                rem -= r;
+            }
+        }
+    }
+
     private void handleGet(String path, Map<String, String> qs, Map<String, String> headers,
-                           OutputStream out, Socket s) throws Exception {
+                           OutputStream out, Socket s, boolean headOnly) throws Exception {
         if ("/".equals(path) || "/index.html".equals(path)) {
-            sendSimple(out, 200, "text/html; charset=utf-8", htmlBytes);
+            if (headOnly) {
+                String hdr = "HTTP/1.1 200 OK\r\n"
+                        + "Content-Type: text/html; charset=utf-8\r\n"
+                        + "Content-Length: " + htmlBytes.length + "\r\n"
+                        + "Cache-Control: no-store\r\n"
+                        + "Connection: close\r\n\r\n";
+                out.write(hdr.getBytes(UTF8));
+                out.flush();
+            } else {
+                sendSimple(out, 200, "text/html; charset=utf-8", htmlBytes);
+            }
             return;
         }
         if ("/api/info".equals(path)) {
@@ -222,7 +302,9 @@ public class WebBridge {
                 sendSimple(out, 403, "text/plain", "Forbidden".getBytes(UTF8));
                 return;
             }
-            String fid = URLDecoder.decode(path.substring("/api/download/".length()), "UTF-8");
+            String rawTail = path.substring("/api/download/".length());
+            int slash = rawTail.indexOf('/');
+            String fid = URLDecoder.decode(slash >= 0 ? rawTail.substring(0, slash) : rawTail, "UTF-8");
             SharedFile sf;
             synchronized (lock) {
                 sf = cli.files.get(fid);
@@ -236,20 +318,60 @@ public class WebBridge {
             String mime = ext == null ? null : MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext.toLowerCase(Locale.US));
             if (mime == null || mime.isEmpty()) mime = "application/octet-stream";
             String encodedName = URLEncoder.encode(sf.name, "UTF-8").replace("+", "%20");
+            String asciiName = asciiFallbackName(sf.name);
+            long[] rng = sf.size >= 0 ? parseRange(headers.get("range"), sf.size) : null;
+            if (rng != null && rng[0] < 0) {
+                String hdr416 = "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                        + "Content-Range: bytes */" + Math.max(sf.size, 0) + "\r\n"
+                        + "Accept-Ranges: bytes\r\n"
+                        + "Content-Length: 0\r\n"
+                        + "Connection: close\r\n\r\n";
+                out.write(hdr416.getBytes(UTF8));
+                out.flush();
+                return;
+            }
+            long start = 0;
+            long len = sf.size;
             StringBuilder sb = new StringBuilder();
-            sb.append("HTTP/1.1 200 OK\r\n");
+            if (rng != null) {
+                start = rng[0];
+                len = rng[1] - rng[0] + 1;
+                sb.append("HTTP/1.1 206 Partial Content\r\n");
+                sb.append("Content-Range: bytes ").append(rng[0]).append("-").append(rng[1]).append("/").append(sf.size).append("\r\n");
+            } else {
+                sb.append("HTTP/1.1 200 OK\r\n");
+            }
             sb.append("Content-Type: ").append(mime).append("\r\n");
-            if (sf.size >= 0) sb.append("Content-Length: ").append(sf.size).append("\r\n");
+            if (len >= 0) {
+                sb.append("Content-Length: ").append(len).append("\r\n");
+                sb.append("Accept-Ranges: bytes\r\n");
+            }
+            sb.append("ETag: \"").append(fid).append("\"\r\n");
+            sb.append("X-Content-Type-Options: nosniff\r\n");
             sb.append("Content-Disposition: ").append(inline ? "inline" : "attachment")
-                    .append("; filename*=UTF-8''").append(encodedName).append("\r\n");
+                    .append("; filename=\"").append(asciiName)
+                    .append("\"; filename*=UTF-8''").append(encodedName).append("\r\n");
             sb.append("Connection: close\r\n\r\n");
             out.write(sb.toString().getBytes(UTF8));
+            if (headOnly || len == 0) {
+                out.flush();
+                return;
+            }
+            s.setSoTimeout(0);
             ContentResolver cr = core.ctx.getContentResolver();
             try (InputStream is = cr.openInputStream(sf.uri)) {
                 if (is != null) {
+                    if (start > 0) skipFully(is, start);
                     byte[] buf = new byte[IO_CHUNK];
-                    int r;
-                    while ((r = is.read(buf)) > 0) out.write(buf, 0, r);
+                    long rem = len;
+                    while (true) {
+                        int want = rem >= 0 ? (int) Math.min(buf.length, rem) : buf.length;
+                        if (want <= 0) break;
+                        int r = is.read(buf, 0, want);
+                        if (r <= 0) break;
+                        out.write(buf, 0, r);
+                        if (rem >= 0) rem -= r;
+                    }
                 }
             }
             out.flush();
