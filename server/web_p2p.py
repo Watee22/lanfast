@@ -221,8 +221,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <script>
 const $ = id => document.getElementById(id);
-const CHUNK_SIZE = 64 * 1024;
-const HIGH_WATER = 1024 * 1024;
+const SLAB_SIZE = 4 * 1024 * 1024;   // 每次从磁盘预读 4 MB，大幅减少异步磁盘 I/O
+const HIGH_WATER = 6 * 1024 * 1024;  // 发送缓冲高水位 6 MB，保持 SCTP 窗口满载
+const LOW_WATER = 3 * 1024 * 1024;   // 低水位 3 MB 提前续发，消除锯齿停顿
+const DEFAULT_CHUNK = 64 * 1024;     // 兜底分片 64 KB
+const MAX_CHUNK = 256 * 1024;        // 单消息上限 256 KB（跨浏览器 SCTP 安全上限）
 const RTC_CFG = {
   iceServers: [
     { urls: "stun:stun.cloudflare.com:3478" },
@@ -528,30 +531,65 @@ function dtlsSasEmoji(pc) {
 async function inspectRoute(p) {
   try {
     const stats = await p.pc.getStats();
-    let localType = "";
+    let pair = null;
     stats.forEach(s => {
-      if (s.type === "candidate-pair" && s.state === "succeeded") {
-        const lc = stats.get(s.localCandidateId);
-        if (lc) localType = lc.candidateType || "";
+      if (s.type === "transport" && s.selectedCandidatePairId) {
+        const cand = stats.get(s.selectedCandidatePairId);
+        if (cand) pair = cand;
       }
     });
+    if (!pair) {
+      stats.forEach(s => {
+        if (s.type === "candidate-pair" && s.state === "succeeded" && (s.nominated || s.selected)) {
+          pair = s;
+        }
+      });
+    }
+    if (!pair) {
+      stats.forEach(s => {
+        if (s.type === "candidate-pair" && s.state === "succeeded") pair = s;
+      });
+    }
+    const lc = pair && stats.get(pair.localCandidateId);
+    const rc = pair && stats.get(pair.remoteCandidateId);
+    const localType = (lc && lc.candidateType) || "";
+    const remoteType = (rc && rc.candidateType) || "";
     const sas = dtlsSasEmoji(p.pc);
     const sasTag = sas ? `安全码 ${sas} · ` : "";
-    p.route = localType === "host"
-      ? `🔒 ${sasTag}局域网 P2P 直连（0 服务器流量）`
-      : `🔒 ${sasTag}WebRTC P2P 直连（0 服务器流量）`;
+    let routeLabel = "WebRTC P2P 直连";
+    if (localType === "host" && (!remoteType || remoteType === "host")) {
+      routeLabel = "内网直连 (host)";
+    } else if (localType === "relay" || remoteType === "relay") {
+      routeLabel = "中继转发 (relay)";
+    } else if (localType === "srflx" || remoteType === "srflx") {
+      routeLabel = `公网回环/穿透 (${localType || "?"}↔${remoteType || "?"})`;
+    } else if (localType === "prflx" || remoteType === "prflx") {
+      routeLabel = `对等直连 (${localType || "?"}↔${remoteType || "?"})`;
+    } else if (localType) {
+      routeLabel = `P2P 直连 (${localType})`;
+    }
+    p.route = `🔒 ${sasTag}${routeLabel}`;
     if (activeConnId === p.connId) $("chatSub").textContent = p.route;
   } catch (e) {}
+}
+
+function getChunkSize(pc) {
+  const maxMsg = pc && pc.sctp && Number(pc.sctp.maxMessageSize);
+  if (maxMsg && Number.isFinite(maxMsg) && maxMsg >= 16 * 1024) {
+    return Math.min(MAX_CHUNK, Math.floor(maxMsg));
+  }
+  return DEFAULT_CHUNK;
 }
 
 function bindDataChannel(p, dc) {
   p.dc = dc;
   dc.binaryType = "arraybuffer";
-  dc.bufferedAmountLowThreshold = 256 * 1024;
+  dc.bufferedAmountLowThreshold = LOW_WATER;
   dc.onopen = () => {
     p.ready = true;
     p.route = "🔒 WebRTC P2P 端到端加密直连（0 服务器流量）";
     inspectRoute(p);
+    setTimeout(() => { if (p.ready) inspectRoute(p); }, 1200);
     toast("🔒 已与 " + p.name + " 建立 P2P 直连！");
     renderFriends();
     if (!activeConnId) openChat(p.connId);
@@ -591,7 +629,7 @@ function onDataMessage(p, data) {
       pushMsg(p, { id: Math.random().toString(36).slice(2), dir: "in", kind: "text", text: m.text, time: nowStr() });
       if (activeConnId === p.connId) setStatus("收到来自 " + p.name + " 的加密文字");
     } else if (m.type === "file_meta") {
-      p.recv = { name: m.name, size: m.size, mime: m.mime || "application/octet-stream", chunks: [], got: 0, t0: Date.now() };
+      p.recv = { name: m.name, size: m.size, mime: m.mime || "application/octet-stream", chunks: [], got: 0, t0: Date.now(), lastUi: 0 };
       if (activeConnId === p.connId) setStatus(`正在接收 ${m.name}…`, 0);
     } else if (m.type === "file_end" && p.recv) {
       const r = p.recv; p.recv = null;
@@ -600,7 +638,8 @@ function onDataMessage(p, data) {
       const isImg = /^image\//i.test(r.mime) || /\.(png|jpe?g|gif|webp|bmp)$/i.test(r.name);
       pushMsg(p, { id: Math.random().toString(36).slice(2), dir: "in", kind: "file", fileName: r.name, size: r.size, url, blob, isImg, time: nowStr() });
       if (activeConnId === p.connId) {
-        setStatus(`已接收 ${r.name}（${human(r.size)}）`, 100);
+        const secs = Math.max((Date.now() - r.t0) / 1000, 0.05);
+        setStatus(`已接收 ${r.name}（${human(r.size)}，均速 ${human(r.size / secs)}/s）`, 100);
         setTimeout(() => setStatus("就绪", -1), 1500);
       }
     }
@@ -609,9 +648,13 @@ function onDataMessage(p, data) {
     r.chunks.push(data);
     r.got += data.byteLength;
     if (activeConnId === p.connId) {
-      const pct = r.size > 0 ? Math.round(r.got * 100 / r.size) : 100;
-      const spd = r.got / Math.max((Date.now() - r.t0) / 1000, 0.1);
-      setStatus(`接收 ${r.name}  ${human(r.got)}/${human(r.size)}  ${human(spd)}/s`, pct);
+      const now = Date.now();
+      if (now - r.lastUi > 120 || r.got >= r.size) {
+        r.lastUi = now;
+        const pct = r.size > 0 ? Math.round(r.got * 100 / r.size) : 100;
+        const spd = r.got / Math.max((now - r.t0) / 1000, 0.05);
+        setStatus(`接收 ${r.name}  ${human(r.got)}/${human(r.size)}  ${human(spd)}/s`, pct);
+      }
     }
   }
 }
@@ -630,10 +673,25 @@ function sendText() {
 }
 
 function waitBufferLow(dc) {
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
+    if (dc.readyState !== "open") { reject(new Error("P2P 通道中断")); return; }
     if (dc.bufferedAmount <= HIGH_WATER) { resolve(); return; }
-    const done = () => { dc.removeEventListener("bufferedamountlow", done); resolve(); };
-    dc.addEventListener("bufferedamountlow", done);
+    let timer = null;
+    const cleanup = () => {
+      dc.removeEventListener("bufferedamountlow", onLow);
+      dc.removeEventListener("close", onClose);
+      dc.removeEventListener("error", onClose);
+      if (timer) clearInterval(timer);
+    };
+    const onLow = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); reject(new Error("P2P 通道中断")); };
+    dc.addEventListener("bufferedamountlow", onLow);
+    dc.addEventListener("close", onClose);
+    dc.addEventListener("error", onClose);
+    timer = setInterval(() => {
+      if (dc.readyState !== "open") onClose();
+      else if (dc.bufferedAmount <= LOW_WATER) onLow();
+    }, 100);
   });
 }
 
@@ -641,6 +699,7 @@ async function sendFiles(files) {
   const p = peers.get(activeConnId);
   if (!p || !p.ready || !p.dc) { toast("连接尚未就绪或已断开"); return; }
   const arr = Array.from(files || []);
+  const chunkSize = getChunkSize(p.pc);
   for (let i = 0; i < arr.length; i++) {
     const f = arr[i];
     const t0 = Date.now();
@@ -648,20 +707,28 @@ async function sendFiles(files) {
       p.dc.send(JSON.stringify({ type: "file_meta", name: f.name, size: f.size, mime: f.type || "application/octet-stream" }));
       let offset = 0, lastUi = 0;
       while (offset < f.size) {
-        await waitBufferLow(p.dc);
-        if (p.dc.readyState !== "open") throw new Error("P2P 通道中断");
-        const buf = await f.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
-        p.dc.send(buf);
-        offset += buf.byteLength;
-        const now = Date.now();
-        if (now - lastUi > 120 || offset >= f.size) {
-          lastUi = now;
-          const pct = Math.round(offset * 100 / Math.max(f.size, 1));
-          const spd = offset / Math.max((now - t0) / 1000, 0.05);
-          setStatus(`发送 [${i+1}/${arr.length}] ${f.name}  ${human(offset)}/${human(f.size)}  ${human(spd)}/s`, pct);
+        const slabEnd = Math.min(f.size, offset + SLAB_SIZE);
+        const slab = await f.slice(offset, slabEnd).arrayBuffer();
+        let pos = 0;
+        while (pos < slab.byteLength) {
+          if (p.dc.bufferedAmount > HIGH_WATER) {
+            await waitBufferLow(p.dc);
+          }
+          if (p.dc.readyState !== "open") throw new Error("P2P 通道中断");
+          const len = Math.min(chunkSize, slab.byteLength - pos);
+          p.dc.send(new Uint8Array(slab, pos, len));
+          pos += len;
+          offset += len;
+          const now = Date.now();
+          if (now - lastUi > 120 || offset >= f.size) {
+            lastUi = now;
+            const pct = Math.round(offset * 100 / Math.max(f.size, 1));
+            const spd = offset / Math.max((now - t0) / 1000, 0.05);
+            setStatus(`发送 [${i+1}/${arr.length}] ${f.name}  ${human(offset)}/${human(f.size)}  ${human(spd)}/s`, pct);
+          }
         }
       }
-      await waitBufferLow(p.dc);
+      if (p.dc.bufferedAmount > HIGH_WATER) await waitBufferLow(p.dc);
       p.dc.send(JSON.stringify({ type: "file_end" }));
       pushMsg(p, { id: Math.random().toString(36).slice(2), dir: "out", kind: "file", fileName: f.name, size: f.size, time: nowStr() });
       const secs = Math.max((Date.now() - t0) / 1000, 0.05);
